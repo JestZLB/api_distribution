@@ -1,0 +1,124 @@
+# Build output
+/build/bin/
+/api_distribution
+/api_distribution.exe
+/build/windows/installer/*.exe
+/build/windows/installer/output/
+
+# Embedded frontend dist (regenerated on `wails build`)
+/frontend/dist/
+
+# Frontend dependencies + build cache
+/frontend/node_modules/
+/frontend/.vite/
+/frontend/*.tsbuildinfo
+/frontend/package.json.md5
+/frontend/frontend/tsc_output.txt
+
+# Wails generated bindings (regenerated on `wails dev` / `wails build`)
+/frontend/wailsjs/
+
+# Local user config (never commit — contains real API keys)
+/config.json
+
+# IDE
+/.idea/
+/.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and runtime artifacts
+*.log
+*.tmp
+*.bak
+
+# Go build cache (local)
+/vendor/
+
+# Frontend dev caches
+.eslintcache
+.parcel-cache/
+.turbo/
+.next/
+.nuxt/
+
+# Coverage / test output
+coverage/
+*.cover
+*.out
+.trae/documents/style-tune-localized.md
+.trae/skills/use-x-chat/SKILL.md
+.trae/skills/use-x-chat/reference/API.md
+.trae/skills/use-x-chat/reference/CORE.md
+.trae/skills/use-x-chat/reference/EXAMPLES.md
+.trae/skills/x-card/SKILL.md
+.trae/skills/x-card/reference/ACTIONS.md
+.trae/skills/x-card/reference/API.md
+.trae/skills/x-card/reference/CATALOG.md
+.trae/skills/x-card/reference/COMMANDS.md
+.trae/skills/x-card/reference/DATA_BINDING.md
+.trae/skills/x-card/reference/INTRODUCTION.md
+.trae/skills/x-card/reference/USAGE.md
+.trae/skills/x-chat-provider/SKILL.md
+.trae/skills/x-chat-provider/reference/EXAMPLES.md
+.trae/skills/x-components/SKILL.md
+.trae/skills/x-components/reference/API.md
+.trae/skills/x-components/reference/COMPONENTS.md
+.trae/skills/x-components/reference/PATTERNS.md
+.trae/skills/x-markdown/SKILL.md
+.trae/skills/x-markdown/reference/API.md
+.trae/skills/x-markdown/reference/CORE.md
+.trae/skills/x-markdown/reference/EXTENSIONS.md
+.trae/skills/x-markdown/reference/STREAMING.md
+.trae/skills/x-request/SKILL.md
+.trae/skills/x-request/reference/API.md
+.trae/skills/x-request/reference/CORE.md
+.trae/skills/x-request/reference/EXAMPLES_SERVICE_PROVIDER.md
+.trae/specs/antd-migration/checklist.md
+.trae/specs/antd-migration/spec.md
+.trae/specs/antd-migration/tasks.md
+.trae/specs/antd-pure-refactor/checklist.md
+.trae/specs/antd-pure-refactor/spec.md
+.trae/specs/antd-pure-refactor/tasks.md
+.trae/specs/audit-fixes-and-docs/checklist.md
+.trae/specs/audit-fixes-and-docs/spec.md
+.trae/specs/audit-fixes-and-docs/tasks.md
+.trae/specs/cleanup-low-priority-issues/checklist.md
+.trae/specs/cleanup-low-priority-issues/spec.md
+.trae/specs/cleanup-low-priority-issues/tasks.md
+.trae/specs/enhance-frontend-ux-design/checklist.md
+.trae/specs/enhance-frontend-ux-design/spec.md
+.trae/specs/enhance-frontend-ux-design/tasks.md
+.trae/specs/fix-ui-backend-alignment/checklist.md
+.trae/specs/fix-ui-backend-alignment/spec.md
+.trae/specs/fix-ui-backend-alignment/tasks.md
+.trae/specs/harden-memory-and-concurrency/checklist.md
+.trae/specs/harden-memory-and-concurrency/spec.md
+.trae/specs/harden-memory-and-concurrency/tasks.md
+.trae/specs/polish-layout-stats-realtime/checklist.md
+.trae/specs/polish-layout-stats-realtime/spec.md
+.trae/specs/polish-layout-stats-realtime/tasks.md
+.trae/specs/review-feature-gaps/checklist.md
+.trae/specs/review-feature-gaps/spec.md
+.trae/specs/review-feature-gaps/tasks.md
+build/appicon.png
+build/README.md
+build/darwin/Info.dev.plist
+build/darwin/Info.plist
+build/windows/icon.ico
+build/windows/info.json
+build/windows/wails.exe.manifest
+build/windows/installer/project.nsi
+build/windows/installer/wails_tools.nsh
+design-system/api-distribution/MASTER.md
+frontend/.trae/specs/ui-restructure/checklist.md
+frontend/.trae/specs/ui-restructure/spec.md
+frontend/.trae/specs/ui-restructure/tasks.md

@@ -1,0 +1,398 @@
+import {create} from 'zustand'
+import * as App from '../../wailsjs/go/main/App'
+import {EventsOn} from '../../wailsjs/runtime/runtime'
+import type {Config, Provider, ModelAlias, ServerStatus, Stats, LogEntry, ClientKey} from '@/types'
+import {toWailsConfig, toWailsProvider, toWailsModelAlias, toWailsClientKey} from '@/lib/wails'
+
+interface StatsWithComparison extends Stats {
+  prevRequests: number
+  prevInputTokens: number
+  prevOutputTokens: number
+  prevAvgLatency: number
+}
+
+interface ConfigState {
+  config: Config | null
+  serverStatus: ServerStatus | null
+  stats: Stats | null
+  statsWithComparison: StatsWithComparison | null
+  providers: Provider[]
+  modelAliases: ModelAlias[]
+  logs: LogEntry[]
+  loading: boolean
+  /** Boot-time connection state for the Wails backend. */
+  bootStatus: 'initializing' | 'ready' | 'degraded' | 'failed'
+  /** Last refresh error per data slice (e.g. 'logs', 'stats', 'load'). */
+  refreshErrors: Record<string, string | null>
+  /** Last successful load timestamp (ms since epoch). */
+  lastLoadedAt: number | null
+  /** Set when the boot loader failed. */
+  bootError: string | null
+
+  load: () => Promise<void>
+  refreshServer: () => Promise<void>
+  refreshStats: () => Promise<void>
+  refreshStatsWithComparison: () => Promise<void>
+  refreshLogs: () => Promise<void>
+  refreshAll: () => Promise<void>
+
+  saveConfig: (cfg: Config) => Promise<void>
+  updateServerSettings: (host: string, port: number) => Promise<void>
+  setClientKeys: (keys: ClientKey[]) => Promise<void>
+
+  upsertProvider: (p: Provider) => Promise<Provider>
+  deleteProvider: (id: string) => Promise<void>
+
+  upsertModelAlias: (m: ModelAlias) => Promise<ModelAlias>
+  deleteModelAlias: (id: string) => Promise<void>
+
+  startServer: () => Promise<void>
+  stopServer: () => Promise<void>
+  restartServer: () => Promise<void>
+  clearLogs: () => Promise<void>
+
+  /**
+   * Subscribe to the backend's `stats:changed` event. Each emission
+   * re-pulls the stats (with comparison). Returns an unsubscribe
+   * function that the caller must invoke in a `useEffect` cleanup.
+   */
+  subscribeStatsEvents: () => () => void
+
+  /**
+   * Subscribe to the backend's `logs:changed` event. Each emission
+   * re-pulls the recent log buffer only — does NOT touch stats.
+   * Returns an unsubscribe function for `useEffect` cleanup.
+   */
+  subscribeLogsEvents: () => () => void
+}
+
+export const useConfigStore = create<ConfigState>((set, get) => ({
+  config: null,
+  serverStatus: null,
+  stats: null,
+  statsWithComparison: null,
+  providers: [],
+  modelAliases: [],
+  logs: [],
+  loading: false,
+  bootStatus: 'initializing' as ConfigState['bootStatus'],
+  refreshErrors: {} as ConfigState['refreshErrors'],
+  lastLoadedAt: null,
+  bootError: null,
+
+  async load() {
+    set({loading: true, bootStatus: 'initializing', bootError: null})
+    try {
+      const cfgRaw = await App.GetConfig()
+      const [status, statsWC, logs, providers, aliases] = await Promise.all([
+        App.GetServerStatus(),
+        App.GetStatsWithComparison().catch(() => App.GetStats()),
+        App.GetLogs(200),
+        App.ListProviders(),
+        App.ListModelAliases(),
+      ])
+      // Strip wails class instance methods (e.g. Config.convertValues)
+      // before assigning to state — state types are plain-object types.
+      const cfg: Config = {
+        serverHost: cfgRaw.serverHost,
+        serverPort: cfgRaw.serverPort,
+        clientKeys: cfgRaw.clientKeys as unknown as ClientKey[],
+        logRetention: cfgRaw.logRetention,
+        providers: cfgRaw.providers as unknown as Provider[],
+        modelAliases: cfgRaw.modelAliases as unknown as ModelAlias[],
+      }
+      const isComparison = 'prevRequests' in (statsWC as object)
+      set({
+        config: cfg,
+        serverStatus: status,
+        stats: isComparison ? {
+          totalRequests: (statsWC as StatsWithComparison).totalRequests,
+          totalInputTokens: (statsWC as StatsWithComparison).totalInputTokens,
+          totalOutputTokens: (statsWC as StatsWithComparison).totalOutputTokens,
+          avgLatencyMs: (statsWC as StatsWithComparison).avgLatencyMs,
+          requestsByModel: (statsWC as StatsWithComparison).requestsByModel,
+          requestsByProvider: (statsWC as StatsWithComparison).requestsByProvider,
+          requestsByClientKey: (statsWC as StatsWithComparison).requestsByClientKey,
+          requestsByClientKeyRecent: (statsWC as StatsWithComparison).requestsByClientKeyRecent,
+          requestsByHour: (statsWC as StatsWithComparison).requestsByHour,
+          requestsByHourByModel: (statsWC as StatsWithComparison).requestsByHourByModel,
+        } as unknown as Stats : statsWC as Stats,
+        statsWithComparison: isComparison ? statsWC as unknown as StatsWithComparison : null,
+        logs,
+        providers: providers as unknown as Provider[],
+        modelAliases: aliases as unknown as ModelAlias[],
+        loading: false,
+        bootStatus: 'ready',
+        bootError: null,
+        lastLoadedAt: Date.now(),
+        refreshErrors: {},
+      })
+    } catch (err) {
+      set({
+        loading: false,
+        bootStatus: 'failed',
+        bootError: err instanceof Error ? err.message : String(err),
+      })
+      throw err
+    }
+  },
+
+  async refreshServer() {
+    try {
+      const status = await App.GetServerStatus()
+      set({serverStatus: status})
+    } catch (err) {
+      set((s) => ({refreshErrors: {...s.refreshErrors, server: String(err)}}))
+    }
+  },
+
+  async refreshStats() {
+    try {
+      const stats = await App.GetStats()
+      set({stats})
+      set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+    } catch (err) {
+      set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(err)}}))
+    }
+  },
+
+  async refreshStatsWithComparison() {
+    try {
+      const statsWC = await App.GetStatsWithComparison()
+      const nextStats: Stats = {
+        totalRequests: statsWC.totalRequests,
+        totalInputTokens: statsWC.totalInputTokens,
+        totalOutputTokens: statsWC.totalOutputTokens,
+        avgLatencyMs: statsWC.avgLatencyMs,
+        requestsByModel: statsWC.requestsByModel,
+        requestsByProvider: statsWC.requestsByProvider,
+        requestsByClientKey: statsWC.requestsByClientKey,
+        requestsByClientKeyRecent: statsWC.requestsByClientKeyRecent,
+        requestsByHour: statsWC.requestsByHour,
+        // Per-model hourly breakdown feeds the ModelTrendChart; without
+        // this copy the chart's `data` prop is permanently undefined.
+        requestsByHourByModel: statsWC.requestsByHourByModel,
+      } as unknown as Stats
+      // Compare against the previous stats; if nothing actually changed
+      // (same totals, same hourly shape) keep the existing reference so
+      // memoized selectors / useMemo caches downstream don't all
+      // invalidate on every 2s heartbeat. The store-equality check
+      // avoids a deep compare while still being cheap.
+      const prevStats = get().stats
+      if (statsShallowEqual(prevStats, nextStats)) {
+        set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+      } else {
+        set({
+          stats: nextStats,
+          statsWithComparison: statsWC as unknown as StatsWithComparison,
+        })
+        set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+      }
+    } catch (err) {
+      // Fallback to basic stats if comparison endpoint not available
+      try {
+        const stats = await App.GetStats()
+        const prevStats = get().stats
+        if (statsShallowEqual(prevStats, stats)) {
+          set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+        } else {
+          set({stats})
+          set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+        }
+      } catch (innerErr) {
+        set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(innerErr)}}))
+      }
+    }
+  },
+
+  async refreshLogs() {
+    try {
+      const logs = await App.GetLogs(200)
+      // Keep the previous logs reference when entries are unchanged so
+      // the logs table doesn't re-render every 3s poll for nothing.
+      const prevLogs = get().logs
+      if (logsEqual(prevLogs, logs)) {
+        set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+      } else {
+        set({logs})
+        set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+      }
+    } catch (err) {
+      set((s) => ({refreshErrors: {...s.refreshErrors, logs: String(err)}}))
+    }
+  },
+
+  async refreshAll() {
+    try {
+      const [status, statsWC, logs, providers, aliases] = await Promise.all([
+        App.GetServerStatus(),
+        App.GetStatsWithComparison().catch(() => App.GetStats()),
+        App.GetLogs(200),
+        App.ListProviders(),
+        App.ListModelAliases(),
+      ])
+      const isComparison = 'prevRequests' in (statsWC as object)
+      set({
+        serverStatus: status,
+        stats: isComparison ? {
+          totalRequests: (statsWC as StatsWithComparison).totalRequests,
+          totalInputTokens: (statsWC as StatsWithComparison).totalInputTokens,
+          totalOutputTokens: (statsWC as StatsWithComparison).totalOutputTokens,
+          avgLatencyMs: (statsWC as StatsWithComparison).avgLatencyMs,
+          requestsByModel: (statsWC as StatsWithComparison).requestsByModel,
+          requestsByProvider: (statsWC as StatsWithComparison).requestsByProvider,
+          requestsByClientKey: (statsWC as StatsWithComparison).requestsByClientKey,
+          requestsByClientKeyRecent: (statsWC as StatsWithComparison).requestsByClientKeyRecent,
+          requestsByHour: (statsWC as StatsWithComparison).requestsByHour,
+          requestsByHourByModel: (statsWC as StatsWithComparison).requestsByHourByModel,
+        } as unknown as Stats : statsWC as Stats,
+        statsWithComparison: isComparison ? statsWC as unknown as StatsWithComparison : null,
+        logs,
+        providers: providers as unknown as Provider[],
+        modelAliases: aliases as unknown as ModelAlias[],
+      })
+      set((s) => ({refreshErrors: {...s.refreshErrors, load: null}, lastLoadedAt: Date.now()}))
+    } catch (err) {
+      set((s) => ({refreshErrors: {...s.refreshErrors, load: String(err)}}))
+    }
+  },
+
+  async saveConfig(cfg) {
+    // Wails types Config as a class; cast through any to bridge.
+    await App.SaveConfig(toWailsConfig(cfg))
+    set({config: cfg})
+    await get().refreshServer()
+  },
+
+  async updateServerSettings(host, port) {
+    await App.UpdateServerSettings(host, port)
+    set((state) => ({
+      config: state.config
+        ? {...state.config, serverHost: host, serverPort: port}
+        : state.config,
+    }))
+    await get().refreshServer()
+  },
+
+  async setClientKeys(keys) {
+    const cfg = get().config
+    if (!cfg) return
+    await App.SaveConfig(toWailsConfig({...cfg, clientKeys: keys}))
+    set({config: {...cfg, clientKeys: keys}})
+    await get().refreshAll()
+  },
+
+  async upsertProvider(p) {
+    const saved = await App.UpsertProvider(toWailsProvider(p))
+    await get().refreshAll()
+    return saved as unknown as Provider
+  },
+
+  async deleteProvider(id) {
+    await App.DeleteProvider(id)
+    await get().refreshAll()
+  },
+
+  async upsertModelAlias(m) {
+    const saved = await App.UpsertModelAlias(toWailsModelAlias(m))
+    await get().refreshAll()
+    return saved as unknown as ModelAlias
+  },
+
+  async deleteModelAlias(id) {
+    await App.DeleteModelAlias(id)
+    await get().refreshAll()
+  },
+
+  async startServer() {
+    await App.StartServer()
+    await get().refreshServer()
+  },
+
+  async stopServer() {
+    await App.StopServer()
+    await get().refreshServer()
+  },
+
+  async restartServer() {
+    await App.RestartServer()
+    await get().refreshServer()
+  },
+
+  async clearLogs() {
+    await App.ClearLogs()
+    await get().refreshLogs()
+  },
+
+  subscribeStatsEvents() {
+    // The closure must access the store via `get()` (not via captured
+    // references) so it always sees the latest state/methods.
+    return EventsOn('stats:changed', () => {
+      void get()
+        .refreshStatsWithComparison()
+        .catch((err) => {
+          // The error is already recorded inside refreshStatsWithComparison
+          // (refreshErrors.stats), but record it here as well in case the
+          // comparison path fails before reaching the fallback.
+          const message = err instanceof Error ? err.message : String(err)
+          set((s) => ({refreshErrors: {...s.refreshErrors, stats: message}}))
+        })
+    })
+  },
+
+  subscribeLogsEvents() {
+    // Dedicated subscription for the `logs:changed` backend event so
+    // it doesn't share a single hook with `stats:changed` (which would
+    // cause every 2s heartbeat to trigger a full stats *and* logs
+    // refetch, doubling IPC traffic on idle pages).
+    return EventsOn('logs:changed', () => {
+      void get()
+        .refreshLogs()
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err)
+          set((s) => ({refreshErrors: {...s.refreshErrors, logs: message}}))
+        })
+    })
+  },
+}))
+
+/**
+ * Cheap equality check for the stats shape: scalar totals + per-key
+ * lengths. We don't deep-compare the per-hour buckets because the
+ * hourly window is already bounded (≤168 entries / 7 days) and the
+ * downstream chart already memoizes on it. Trading a tiny precision
+ * loss for reference stability saves a full re-render cascade on
+ * every 2s heartbeat.
+ */
+function statsShallowEqual(a: Stats | null, b: Stats | null): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  // Also include the per-model hourly map length: when a new request
+  // for a brand-new alias lands, totalRequests goes up but the alias
+  // count changes too; without this check the chart could miss the
+  // new line on its very first request.
+  return (
+    a.totalRequests === b.totalRequests &&
+    a.totalInputTokens === b.totalInputTokens &&
+    a.totalOutputTokens === b.totalOutputTokens &&
+    a.avgLatencyMs === b.avgLatencyMs &&
+    a.requestsByHour.length === b.requestsByHour.length &&
+    Object.keys(a.requestsByClientKey).length ===
+      Object.keys(b.requestsByClientKey).length &&
+    Object.keys(a.requestsByModel).length === Object.keys(b.requestsByModel).length &&
+    Object.keys(a.requestsByHourByModel ?? {}).length ===
+      Object.keys(b.requestsByHourByModel ?? {}).length
+  )
+}
+
+/**
+ * Compare two log lists by length + first/last entries. The backend
+ * returns logs in newest-first order, so the first/last IDs are a
+ * reasonable change signal without scanning every row.
+ */
+function logsEqual(a: LogEntry[], b: LogEntry[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  if (a.length === 0) return true
+  return a[0].id === b[0].id && a[a.length - 1].id === b[b.length - 1].id
+}

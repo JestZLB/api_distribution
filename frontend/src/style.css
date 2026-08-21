@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Minimal global tokens. All colors / borders / shadows are now owned
+ * by antd's theme via ConfigProvider. We only keep font stack, motion
+ * variables used by tailwind-animate-style keyframes, and the
+ * scrollbar styling that antd does not cover. */
+
+@theme {
+  /* Typography */
+  --font-sans: "Inter", "SF Pro Text", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Motion */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Color tokens — single source of truth is antd's theme (ConfigProvider
+   * with cssVar enabled). Each Tailwind utility (bg-bg, text-fg, bg-accent,
+   * …) resolves to an antd CSS variable so light/dark switching stays in
+   * sync automatically. */
+  --color-bg: var(--ant-color-bg-layout);
+  --color-bg-elevated: var(--ant-color-bg-elevated);
+  --color-bg-subtle: var(--ant-color-fill-secondary);
+
+  --color-fg: var(--ant-color-text);
+  --color-fg-muted: var(--ant-color-text-secondary);
+  --color-fg-subtle: var(--ant-color-text-tertiary);
+  --color-fg-on-accent: var(--ant-color-white);
+
+  --color-accent: var(--ant-color-primary);
+  --color-accent-soft: var(--ant-color-primary-bg);
+
+  --color-success: var(--ant-color-success);
+  --color-success-soft: var(--ant-color-success-bg);
+  --color-warning: var(--ant-color-warning);
+  --color-danger: var(--ant-color-error);
+  --color-danger-soft: var(--ant-color-error-bg);
+
+  /* Chart series colors used by the traffic/usage charts. These are
+   * referenced (e.g. RecentTrafficChart) but were never defined, so the
+   * bars resolved to an invalid color. Map them to the antd success /
+   * error tokens so light/dark switching stays in sync. */
+  --color-chart-success: var(--ant-color-success);
+  --color-chart-error: var(--ant-color-error);
+
+  --color-border: var(--ant-color-border);
+  --color-border-strong: var(--ant-color-border-secondary);
+}
+
+/* antd's cssVar mode declares its --ant-* tokens on the ConfigProvider root
+ * element (class = cssVar.key, here "api-distribution"), NOT on :root. A
+ * custom property whose value references an undefined var() is invalid at
+ * declaration time, so the @theme --color-* aliases above would resolve to
+ * nothing on :root. Re-declare them on the antd root element so every
+ * descendant (all page content) resolves them against the live antd tokens
+ * and stays in sync across light/dark switching. */
+.api-distribution {
+  --color-bg: var(--ant-color-bg-layout);
+  --color-bg-elevated: var(--ant-color-bg-elevated);
+  --color-bg-subtle: var(--ant-color-fill-secondary);
+
+  --color-fg: var(--ant-color-text);
+  --color-fg-muted: var(--ant-color-text-secondary);
+  --color-fg-subtle: var(--ant-color-text-tertiary);
+  --color-fg-on-accent: var(--ant-color-white);
+
+  --color-accent: var(--ant-color-primary);
+  --color-accent-soft: var(--ant-color-primary-bg);
+
+  --color-success: var(--ant-color-success);
+  --color-success-soft: var(--ant-color-success-bg);
+  --color-warning: var(--ant-color-warning);
+  --color-danger: var(--ant-color-error);
+  --color-danger-soft: var(--ant-color-error-bg);
+
+  /* Chart series colors — see the @theme block above. */
+  --color-chart-success: var(--ant-color-success);
+  --color-chart-error: var(--ant-color-error);
+
+  --color-border: var(--ant-color-border);
+  --color-border-strong: var(--ant-color-border-secondary);
+}
+
+/* antd's cssVar tokens live on the ConfigProvider root, not :root, so
+ * var(--ant-color-bg-layout) is unavailable here. Use the matching
+ * colorBgLayout values explicitly so the page never flashes a bare
+ * background before React mounts. */
+html {
+  background-color: #f5f5f5;
+  color: rgba(0, 0, 0, 0.88);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.dark {
+  color-scheme: dark;
+  background-color: #000;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+body {
+  margin: 0;
+  background-color: inherit;
+  color: inherit;
+}
+
+/* Make the React root a vertical flex container so antd Layout's
+ * h-screen / h-full can stretch to the viewport without nested
+ * double-layout artifacts. */
+#root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+* { border-color: var(--ant-color-border); }
+
+::selection {
+  background-color: var(--ant-color-primary);
+  color: var(--ant-color-white);
+}
+
+h1, h2, h3, h4 {
+  letter-spacing: -0.025em;
+  font-weight: 600;
+}
+
+::placeholder {
+  color: var(--ant-color-text-tertiary);
+  opacity: 1;
+}
+
+/* Scrollbar — not covered by antd's design tokens. */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--ant-color-fill-secondary);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--ant-color-fill); }
+.dark ::-webkit-scrollbar-thumb { background: var(--ant-color-fill-secondary); }
+.dark ::-webkit-scrollbar-thumb:hover { background: var(--ant-color-fill); }
+
+/* Focus — use the primary accent so focus rings match the theme. */
+*:focus-visible {
+  outline: 2px solid var(--ant-color-primary);
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* Animations now come from antd's BorderBeam component (uses
+ * @keyframes antBorderBeamMove internally). Any custom keyframes
+ * previously defined here for a hand-rolled beam implementation
+ * have been removed. */
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
