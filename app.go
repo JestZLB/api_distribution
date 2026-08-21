@@ -37,6 +37,11 @@ type App struct {
 
 	mu      sync.Mutex
 	started bool
+	// forceQuit is set by the explicit Quit paths (tray menu, Settings
+	// "Quit app"). When enabled, OnBeforeClose in main.go lets the
+	// window close instead of hiding to tray, so a deliberate quit
+	// always exits even when close-to-tray is on.
+	forceQuit bool
 
 	// System feature state — driven by Settings UI toggles.
 	closeToTray bool
@@ -111,13 +116,18 @@ func (a *App) startup(ctx context.Context) {
 	// clicking the X would hide the window with no way to restore it).
 	// Start is synchronous up to ~200ms, so it's safe to call inline;
 	// the Win32 message pump itself runs on a background goroutine.
-	if a.tray != nil && (cfg.TrayEnabled || cfg.CloseToTray) {
-		if err := a.tray.Start("API Distribution", &trayForwarder{a: a}); err != nil {
-			fmt.Println("warning: auto-start tray:", err)
-		} else {
-			a.mu.Lock()
-			a.trayStarted = true
-			a.mu.Unlock()
+	if a.tray != nil {
+		// Seed the localized menu labels before Start so the very
+		// first right-click uses the persisted language.
+		a.tray.SetLocale(cfg.Locale)
+		if cfg.TrayEnabled || cfg.CloseToTray {
+			if err := a.tray.Start("API Distribution", &trayForwarder{a: a}); err != nil {
+				fmt.Println("warning: auto-start tray:", err)
+			} else {
+				a.mu.Lock()
+				a.trayStarted = true
+				a.mu.Unlock()
+			}
 		}
 	}
 
@@ -719,6 +729,8 @@ func (a *App) SetTrayEnabled(enable bool) error {
 		a.mu.Lock()
 		a.trayStarted = true
 		a.mu.Unlock()
+		// Match the tray menu language to the persisted selection.
+		a.tray.SetLocale(a.cfgMgr.Get().Locale)
 		if err := a.tray.Start("API Distribution", &trayForwarder{a: a}); err != nil {
 			a.mu.Lock()
 			a.trayStarted = false
@@ -748,8 +760,29 @@ func (f *trayForwarder) OnAction(action system.TrayAction) {
 		wruntime.WindowShow(f.a.ctx)
 		wruntime.WindowUnminimise(f.a.ctx)
 	case system.ActionQuit:
-		wruntime.Quit(f.a.ctx)
+		f.a.requestExit()
 	}
+}
+
+// requestExit flags an intentional shutdown and requests Wails to
+// quit. Setting forceQuit first ensures OnBeforeClose won't convert
+// the quit into a window-hide when close-to-tray is enabled.
+func (a *App) requestExit() {
+	if a.ctx == nil {
+		return
+	}
+	a.mu.Lock()
+	a.forceQuit = true
+	a.mu.Unlock()
+	wruntime.Quit(a.ctx)
+}
+
+// forceQuitting reports whether an explicit quit has been requested.
+// Read by main.go's OnBeforeClose decision.
+func (a *App) forceQuitting() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.forceQuit
 }
 
 // ShowWindow brings the main window to the foreground. Used by the
@@ -766,10 +799,28 @@ func (a *App) ShowWindow() {
 // tray menu item and the Settings page "Quit app" button both
 // route through here.
 func (a *App) QuitApp() {
-	if a.ctx == nil {
+	a.requestExit()
+}
+
+// SetLocale records the user's selected UI language (a BCP-47 tag
+// such as "zh-CN") and propagates it to the OS tray menu so its
+// items are localized. The choice is persisted so it survives
+// restarts. The frontend calls this whenever the language changes.
+func (a *App) SetLocale(locale string) {
+	if locale == "" {
 		return
 	}
-	wruntime.Quit(a.ctx)
+	if a.tray != nil {
+		a.tray.SetLocale(locale)
+	}
+	cfg := a.cfgMgr.Get()
+	if cfg.Locale == locale {
+		return
+	}
+	cfg.Locale = locale
+	if err := a.cfgMgr.Save(cfg); err != nil {
+		fmt.Println("warning: save locale:", err)
+	}
 }
 
 // ---------------------------------------------------------------------

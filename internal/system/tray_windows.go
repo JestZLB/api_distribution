@@ -73,6 +73,10 @@ const (
 	wmContextMenu  = 0x007B
 	wmDestroy      = 0x0002
 	wmLButtonDbClk = 0x0203
+	// wmRButtonUp is the legacy (pre-v4) right-click notification the
+	// shell reports when the icon is NOT running under
+	// NOTIFYICON_VERSION_4. v4 uses WM_CONTEXTMENU instead.
+	wmRButtonUp    = 0x0205
 	wmAppNotify    = wmUser + 20
 	wsExToolwindow = 0x00000080
 	idcArrow       = 32512
@@ -83,13 +87,19 @@ const (
 	nifIcon        = 0x00000002
 	nifTip         = 0x00000004
 	nimAdd         = 0x00000000
+	nimSetVersion  = 0x00000004
 	nimDelete      = 0x00000002
-	tpmRightButton = 0x0002
-	tpmReturnCmd   = 0x0100
-	tpmNonNotify   = 0x0080
-	mfString       = 0x0000
-	mfSeparator    = 0x0800
-	pmNoYield      = 0x0002
+	// notifyIconVersion4 enables the waiter/Shell_NotifyIcon
+	// callback behaviour where the shell reports button presses as
+	// WM_CONTEXTMENU (right-click) / WM_LBUTTONDBLCLK (double-click)
+	// in lParam instead of the legacy per-button-up messages.
+	notifyIconVersion4 = 4
+	tpmRightButton     = 0x0002
+	tpmReturnCmd       = 0x0100
+	tpmNonNotify       = 0x0080
+	mfString           = 0x0000
+	mfSeparator        = 0x0800
+	pmNoYield          = 0x0002
 )
 
 // trayClassName is the unique window class for our hidden window.
@@ -158,6 +168,7 @@ type winTray struct {
 	running bool
 	cb      TrayCallbacks
 	tip     string
+	locale  string // BCP-47 tag; "" → en-US fallback for menu labels
 	iconPng []byte // appicon.png bytes; used to build the HICON
 	stopCh  chan struct{}
 	done    chan struct{}
@@ -166,6 +177,16 @@ type winTray struct {
 
 func newPlatformTray(iconPng []byte) *winTray {
 	return &winTray{iconPng: iconPng}
+}
+
+// SetLocale stores the active language tag for localized menu labels.
+// Menus are rebuilt on every right-click, so the next menu reflects
+// the new locale immediately. Accepts any string; unknown tags fall
+// back to en-US when the menu is built.
+func (t *winTray) SetLocale(locale string) {
+	t.mu.Lock()
+	t.locale = locale
+	t.mu.Unlock()
 }
 
 func (t *winTray) Active() bool {
@@ -311,6 +332,15 @@ func (t *winTray) run() {
 	copy(nid.SzTip[:], tipUTF16)
 	procShellNotifyIcon.Call(uintptr(nimAdd), uintptr(unsafe.Pointer(&nid)))
 
+	// Opt in to the modern callback contract. Without NIM_SETVERSION
+	// the shell reports a right-click as the legacy WM_RBUTTONUP in
+	// lParam, which onMessage never listens for — so the context
+	// menu silently never opened. With NOTIFYICON_VERSION_4 the
+	// shell delivers WM_CONTEXTMENU for right-click and
+	// WM_LBUTTONDBLCLK for double-click in lParam instead.
+	nid.UVersion = notifyIconVersion4
+	procShellNotifyIcon.Call(uintptr(nimSetVersion), uintptr(unsafe.Pointer(&nid)))
+
 	t.mu.Lock()
 	t.running = true
 	t.mu.Unlock()
@@ -360,23 +390,28 @@ func trayWndProc(hwnd uintptr, m uint32, wParam, lParam uintptr) uintptr {
 func (t *winTray) onMessage(hwnd uintptr, m uint32, wParam, lParam uintptr) (bool, uintptr) {
 	switch m {
 	case wmAppNotify:
-		switch lParam {
-		case wmContextMenu, wmLButtonDbClk:
+		// The mouse event is in the LOWORD of lParam. HIWORD holds
+		// the icon ID (1) when running under NOTIFYICON_VERSION_4,
+		// so we MUST mask the low word before comparing — otherwise
+		// right/double-click never match and the tray appears dead.
+		// We also listen for the legacy wmRButtonUp in case the shell
+		// didn't honour NIM_SETVERSION.
+		switch uintptr(uint32(lParam) & 0xFFFF) {
+		// Left/middle button double-click opens the main window.
+		// Only a right-click (wmContextMenu / legacy wmRButtonUp)
+		// pops the menu — matching common desktop-app behaviour.
+		case wmLButtonDbClk:
+			t.fire(ActionShow)
+		case wmContextMenu, wmRButtonUp:
 			t.showMenu(hwnd)
 		}
 		return true, 0
 	case wmCommand:
-		t.mu.Lock()
-		cb := t.cb
-		t.mu.Unlock()
-		if cb == nil {
-			return true, 0
-		}
 		switch int(wParam & 0xFFFF) {
 		case idMenuShow:
-			cb.OnAction(ActionShow)
+			t.fire(ActionShow)
 		case idMenuQuit:
-			cb.OnAction(ActionQuit)
+			t.fire(ActionQuit)
 		}
 		return true, 0
 	case wmDestroy:
@@ -384,6 +419,18 @@ func (t *winTray) onMessage(hwnd uintptr, m uint32, wParam, lParam uintptr) (boo
 		return true, 0
 	}
 	return false, 0
+}
+
+// fire reads the current callback under lock and dispatches a tray
+// action. Menu commands, menu selections and double-clicks all route
+// through here.
+func (t *winTray) fire(action TrayAction) {
+	t.mu.Lock()
+	cb := t.cb
+	t.mu.Unlock()
+	if cb != nil {
+		cb.OnAction(action)
+	}
 }
 
 // showMenu pops up the right-click menu anchored at the cursor. With
@@ -398,8 +445,12 @@ func (t *winTray) showMenu(hwnd uintptr) {
 	}
 	defer procDestroyMenu.Call(menu)
 
-	showText, _ := syscall.UTF16PtrFromString("Show main window")
-	quitText, _ := syscall.UTF16PtrFromString("Quit")
+	t.mu.Lock()
+	locale := t.locale
+	t.mu.Unlock()
+	showStr, quitStr := trayMenuStrings(locale)
+	showText, _ := syscall.UTF16PtrFromString(showStr)
+	quitText, _ := syscall.UTF16PtrFromString(quitStr)
 
 	procAppendMenuW.Call(menu, mfString, idMenuShow, uintptr(unsafe.Pointer(showText)))
 	procAppendMenuW.Call(menu, mfSeparator, 0, 0)
@@ -419,17 +470,11 @@ func (t *winTray) showMenu(hwnd uintptr) {
 	)
 
 	// The selected menu id comes back in the low word. Dispatch it.
-	t.mu.Lock()
-	cb := t.cb
-	t.mu.Unlock()
-	if cb == nil {
-		return
-	}
 	switch uintptr(cmd) & 0xFFFF {
 	case idMenuShow:
-		cb.OnAction(ActionShow)
+		t.fire(ActionShow)
 	case idMenuQuit:
-		cb.OnAction(ActionQuit)
+		t.fire(ActionQuit)
 	}
 }
 
@@ -439,6 +484,23 @@ func truncateTip(s string) string {
 		return s
 	}
 	return s[:max]
+}
+
+// trayMenuStrings returns the localized labels for the tray's two
+// menu items given a BCP-47 language tag. Unknown or empty tags fall
+// back to English. The menu is rebuilt per right-click by showMenu,
+// so the current locale always wins.
+func trayMenuStrings(locale string) (show, quit string) {
+	texts := map[string][2]string{
+		"en-US": {"Show main window", "Quit"},
+		"zh-CN": {"显示主窗口", "退出"},
+		"ja-JP": {"メインウィンドウを表示", "終了"},
+		"ko-KR": {"메인 창 표시", "종료"},
+	}
+	if v, ok := texts[locale]; ok {
+		return v[0], v[1]
+	}
+	return texts["en-US"][0], texts["en-US"][1]
 }
 
 var (

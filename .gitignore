@@ -122,3 +122,9 @@ design-system/api-distribution/MASTER.md
 frontend/.trae/specs/ui-restructure/checklist.md
 frontend/.trae/specs/ui-restructure/spec.md
 frontend/.trae/specs/ui-restructure/tasks.md
+.trae/specs/add-model-trend-chart/checklist.md
+.trae/specs/add-model-trend-chart/spec.md
+.trae/specs/add-model-trend-chart/tasks.md
+.trae/specs/modernize-tray-menu/checklist.md
+.trae/specs/modernize-tray-menu/spec.md
+.trae/specs/modernize-tray-menu/tasks.md

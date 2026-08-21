@@ -11,5 +11,6 @@ type stubTray struct{}
 func newPlatformTray(_ []byte) Tray { return stubTray{} }
 
 func (stubTray) Start(_ string, _ TrayCallbacks) error { return ErrUnsupported }
-func (stubTray) Stop()                                  {}
+func (stubTray) SetLocale(_ string)                    {}
+func (stubTray) Stop()                                 {}
 func (stubTray) Active() bool                           { return false }

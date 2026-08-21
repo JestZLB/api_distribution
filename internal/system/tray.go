@@ -32,6 +32,11 @@ type Tray interface {
 	// supplied implementation when the user picks a menu item or
 	// double-clicks the icon.
 	Start(tooltip string, cb TrayCallbacks) error
+	// SetLocale updates the language used for localized tray menu
+	// item labels. Menus are built on demand, so a subsequent
+	// right-click reflects the new locale immediately. Safe to call
+	// before or after Start.
+	SetLocale(locale string)
 	// Stop removes the icon and unhooks the message window. Safe
 	// to call multiple times.
 	Stop()

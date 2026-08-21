@@ -10,7 +10,9 @@ import {Settings} from '@/pages/Settings'
 import {ErrorBoundary} from '@/components/ErrorBoundary'
 import {BootErrorScreen} from '@/components/BootErrorScreen'
 import {useThemeStore} from '@/store/theme'
+import {useLocaleStore} from '@/store/locale'
 import {useConfigStore} from '@/store/config'
+import * as WailsApp from '../wailsjs/go/main/App'
 import {getAntdTheme} from '@/lib/antdTheme'
 import {MessageHolder} from '@/components/MessageHolder'
 
@@ -51,6 +53,15 @@ export default function App() {
       /* bootStatus already set to 'failed' by the store */
     })
   }, [loadConfig])
+
+  // Mirror the persisted UI language to the backend on boot so the
+  // OS tray menu matches the last-selected language. Fire-and-forget.
+  useEffect(() => {
+    const locale = useLocaleStore.getState().locale
+    void WailsApp.SetLocale(locale).catch(() => {
+      /* best-effort sync */
+    })
+  }, [])
 
   const antdTheme = useMemo(() => getAntdTheme(resolvedMode), [resolvedMode])
 

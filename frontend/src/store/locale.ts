@@ -1,4 +1,5 @@
 import {create} from 'zustand'
+import * as App from '../../wailsjs/go/main/App'
 import {locales, type Locale} from '@/i18n/locales'
 
 interface LocaleState {
@@ -41,6 +42,12 @@ export const useLocaleStore = create<LocaleState>((set) => ({
         // localStorage may be unavailable (e.g. SSR), ignore.
       }
     }
+    // Push the selected language to the backend so the OS tray menu
+    // items are localized. Fire-and-forget: a failed call should not
+    // block the UI language switch.
+    void App.SetLocale(l).catch(() => {
+      /* backend sync is best-effort */
+    })
     set({locale: l})
   },
 }));

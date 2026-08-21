@@ -39,7 +39,10 @@ func main() {
 	// quitting when the user enabled the feature.
 	closeToTray := app.cfgMgr.Get().CloseToTray
 	beforeClose := func(_ context.Context) (prevent bool) {
-		if closeToTray && app.ctx != nil {
+		// A deliberate quit (tray "Quit" / Settings "Quit app") sets
+		// forceQuit and MUST exit for real. Only an ordinary window
+		// close (X button) should hide to tray.
+		if closeToTray && !app.forceQuitting() && app.ctx != nil {
 			wruntime.WindowHide(app.ctx)
 			return true
 		}

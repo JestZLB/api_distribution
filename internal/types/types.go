@@ -213,6 +213,10 @@ type Config struct {
 	CloseToTray bool `json:"closeToTray"` // hide window on close instead of quitting
 	AutoStart   bool `json:"autoStart"`   // launch app at login
 	TrayEnabled bool `json:"trayEnabled"` // keep the tray icon visible at all times
+	// Locale is the user's selected UI language tag (e.g. en-US,
+	// zh-CN, ja-JP, ko-KR). It is mirrored to the OS tray menu so the
+	// tray items are localized as well.
+	Locale string `json:"locale"`
 
 	// ShutdownTimeoutSec controls how long server.Stop waits for an
 	// in-flight handler (long SSE streams in particular) to drain
@@ -247,6 +251,9 @@ func (c *Config) Normalize() {
 	}
 	if c.ShutdownTimeoutSec == 0 {
 		c.ShutdownTimeoutSec = def.ShutdownTimeoutSec
+	}
+	if c.Locale == "" {
+		c.Locale = def.Locale
 	}
 }
 
@@ -340,6 +347,7 @@ func DefaultConfig() Config {
 		Providers:          []Provider{},
 		ModelAliases:       []ModelAlias{},
 		ShutdownTimeoutSec: 5,
+		Locale:             "en-US",
 	}
 }
 
