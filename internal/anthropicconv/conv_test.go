@@ -185,8 +185,15 @@ func TestTransformStream(t *testing.T) {
 	srcR := strings.NewReader(input)
 
 	var buf bytes.Buffer
-	if err := TransformStream(srcR, &buf); err != nil {
+	usage, err := TransformStream(srcR, &buf)
+	if err != nil {
 		t.Fatalf("TransformStream: %v", err)
+	}
+
+	// Usage is collected from message_start (input_tokens) and
+	// message_delta (output_tokens) and should reflect the upstream.
+	if usage.InputTokens != 5 || usage.OutputTokens != 2 {
+		t.Errorf("usage = %+v", usage)
 	}
 
 	frames := readFrames(t, buf.String())

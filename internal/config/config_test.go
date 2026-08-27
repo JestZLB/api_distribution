@@ -79,8 +79,8 @@ func TestManager_SaveValidates(t *testing.T) {
 		if got.ServerPort != 8080 {
 			t.Errorf("ServerPort = %d, want 8080", got.ServerPort)
 		}
-		if got.LogRetention != 7 {
-			t.Errorf("LogRetention = %d, want 7", got.LogRetention)
+		if got.LogRetention != 30 {
+			t.Errorf("LogRetention = %d, want 30", got.LogRetention)
 		}
 	})
 

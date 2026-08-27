@@ -23,10 +23,13 @@ import (
 
 // AnthropicUsage reports the token counts returned by an Anthropic
 // Messages response. InputTokens / OutputTokens are zero if the
-// upstream didn't include them.
+// upstream didn't include them. They are int64 to safely hold values
+// up to 2^53 (JSON's lossless range) without overflow: a malicious or
+// malformed upstream returning {"prompt_tokens": 1e20} used to wrap
+// to a negative int32 and corrupt DailyAgg totals.
 type AnthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
 }
 
 // BuildRequest converts an OpenAI Chat Completions request body to an
@@ -190,8 +193,9 @@ func TransformResponse(src io.Reader, w io.Writer) (AnthropicUsage, error) {
 // TransformStream reads an Anthropic Messages SSE stream from src and
 // writes the equivalent OpenAI Chat Completions SSE stream to w. The
 // conversion emits a final `data: [DONE]` frame and flushes after each
-// chunk when the writer supports it.
-func TransformStream(src io.Reader, w io.Writer) error {
+// chunk when the writer supports it. It returns the token usage reported
+// by the upstream so the caller can backfill request logs.
+func TransformStream(src io.Reader, w io.Writer) (AnthropicUsage, error) {
 	scanner := bufio.NewScanner(src)
 	// Anthropic event payloads can be a few KB each; allow generous buffers.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -204,6 +208,7 @@ func TransformStream(src io.Reader, w io.Writer) error {
 		model     string
 		created   = time.Now().Unix()
 		stopSent  bool
+		usage     AnthropicUsage
 	)
 
 	for scanner.Scan() {
@@ -221,13 +226,17 @@ func TransformStream(src io.Reader, w io.Writer) error {
 			case "message_start":
 				var m struct {
 					Message struct {
-						ID    string `json:"id"`
-						Model string `json:"model"`
+						ID    string         `json:"id"`
+						Model string         `json:"model"`
+						Usage AnthropicUsage `json:"usage"`
 					} `json:"message"`
 				}
 				if err := json.Unmarshal([]byte(payload), &m); err == nil {
 					msgID = m.Message.ID
 					model = m.Message.Model
+					// The initial prompt token count is authoritative
+					// here; message_delta only reports output tokens.
+					usage.InputTokens = m.Message.Usage.InputTokens
 				}
 				writeChunk(w, map[string]any{
 					"id":      msgID,
@@ -236,8 +245,8 @@ func TransformStream(src io.Reader, w io.Writer) error {
 					"model":   model,
 					"choices": []map[string]any{
 						{
-							"index":        0,
-							"delta":        map[string]any{"role": "assistant"},
+							"index":         0,
+							"delta":         map[string]any{"role": "assistant"},
 							"finish_reason": nil,
 						},
 					},
@@ -258,8 +267,8 @@ func TransformStream(src io.Reader, w io.Writer) error {
 						"model":   model,
 						"choices": []map[string]any{
 							{
-								"index":        0,
-								"delta":        map[string]any{"content": d.Delta.Text},
+								"index":         0,
+								"delta":         map[string]any{"content": d.Delta.Text},
 								"finish_reason": nil,
 							},
 						},
@@ -271,8 +280,12 @@ func TransformStream(src io.Reader, w io.Writer) error {
 					Delta struct {
 						StopReason string `json:"stop_reason"`
 					} `json:"delta"`
+					Usage AnthropicUsage `json:"usage"`
 				}
 				if err := json.Unmarshal([]byte(payload), &d); err == nil {
+					// The final output token count arrives here once the
+					// model has finished generating the whole message.
+					usage.OutputTokens = d.Usage.OutputTokens
 					writeChunk(w, map[string]any{
 						"id":      msgID,
 						"object":  "chat.completion.chunk",
@@ -280,8 +293,8 @@ func TransformStream(src io.Reader, w io.Writer) error {
 						"model":   model,
 						"choices": []map[string]any{
 							{
-								"index":        0,
-								"delta":        map[string]any{},
+								"index":         0,
+								"delta":         map[string]any{},
 								"finish_reason": mapStopReason(d.Delta.StopReason),
 							},
 						},
@@ -291,7 +304,7 @@ func TransformStream(src io.Reader, w io.Writer) error {
 			case "message_stop":
 				if !stopSent {
 					if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-						return err
+						return usage, err
 					}
 					flushNow(flush)
 					stopSent = true
@@ -300,17 +313,17 @@ func TransformStream(src io.Reader, w io.Writer) error {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return usage, err
 	}
 	// Some upstreams may close the connection before sending
 	// message_stop; still emit [DONE] so OpenAI clients terminate.
 	if !stopSent {
 		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			return err
+			return usage, err
 		}
 		flushNow(flush)
 	}
-	return nil
+	return usage, nil
 }
 
 // ---------------------------------------------------------------------

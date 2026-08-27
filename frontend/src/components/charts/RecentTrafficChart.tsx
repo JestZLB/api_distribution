@@ -1,8 +1,9 @@
-import {useMemo, type ReactNode} from 'react'
+import {useMemo, type JSX, type ReactNode} from 'react'
 import {Column} from '@ant-design/charts'
-import {BorderBeam, Card, Typography} from 'antd'
+import {BorderBeam} from 'antd'
 import {LuZap} from 'react-icons/lu'
-import {EmptyState} from '@/components/ui/EmptyState'
+import {ChartCard} from '@/components/charts/ChartCard'
+import {ChartEmpty} from '@/components/charts/ChartEmpty'
 import {formatNumber} from '@/lib/format'
 import {useT} from '@/i18n/useT'
 import type {HourBucket} from '@/types'
@@ -53,13 +54,37 @@ function readToken(name: string, fallback: string): string {
  * continuous rolling 24-hour window with empty hours defaulting to 0,
  * so the chart always shows the full 24h shape.
  */
-export function RecentTrafficChart({traffic, className}: RecentTrafficChartProps) {
+export function RecentTrafficChart({
+  traffic,
+  className,
+}: RecentTrafficChartProps): JSX.Element {
   const t = useT()
 
-  const {barData, summary, themeColors, totalByKey} = useMemo(() => {
-    const successLabel = t('dashboard.status.success')
-    const errorLabel = t('dashboard.status.error')
+  // Resolve all canvas colors and axis/grid tokens ONCE per mount.
+  // Without this memoization the chart would call getComputedStyle
+  // four times every heartbeat and force a full re-paint.
+  const themeTokens = useMemo(
+    () => ({
+      successHex: readToken('--ant-color-success', '#52c41a'),
+      errorHex: readToken('--ant-color-error', '#ff4d4f'),
+      axis: readToken('--ant-color-text-tertiary', 'rgba(0, 0, 0, 0.35)'),
+      grid: readToken('--ant-color-fill-secondary', 'rgba(0, 0, 0, 0.06)'),
+    }),
+    [],
+  )
 
+  // Translate the success/error labels once; the rows are emitted in
+  // both languages (we keep them distinct strings inside each row so
+  // G2 can match them via the domain/range pairs).
+  const labels = useMemo(
+    () => ({
+      success: t('dashboard.status.success'),
+      error: t('dashboard.status.error'),
+    }),
+    [t],
+  )
+
+  const {barData, summary, totalByKey} = useMemo(() => {
     const byHour = new Map<number, HourBucket>()
     for (const b of traffic) byHour.set(b.hour, b)
 
@@ -82,8 +107,8 @@ export function RecentTrafficChart({traffic, className}: RecentTrafficChartProps
       const success = Math.max(t - e, 0)
       const hour = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
       // Two rows per hour so the column chart can stack the two series.
-      rows.push({hour, status: successLabel, count: success, total: t, errors: e})
-      rows.push({hour, status: errorLabel, count: e, total: t, errors: e})
+      rows.push({hour, status: labels.success, count: success, total: t, errors: e})
+      rows.push({hour, status: labels.error, count: e, total: t, errors: e})
       total += t
       errors += e
       if (t > peak) {
@@ -91,17 +116,6 @@ export function RecentTrafficChart({traffic, className}: RecentTrafficChartProps
         peakHour = hour
       }
     }
-
-    // Token resolution for canvas-rendered colors and SVG-rendered
-    // axis/grid labels. Re-read on every stats refresh so theme
-    // switches are picked up.
-    const successHex = readToken('--ant-color-success', '#52c41a')
-    const errorHex = readToken('--ant-color-error', '#ff4d4f')
-    const axis = readToken('--ant-color-text-tertiary', 'rgba(0, 0, 0, 0.35)')
-    const grid = readToken(
-      '--ant-color-fill-secondary',
-      'rgba(0, 0, 0, 0.06)',
-    )
 
     // O(1) lookup map for the tooltip's customContent renderer. The
     // tooltip needs both the success count and the error count for
@@ -118,16 +132,10 @@ export function RecentTrafficChart({traffic, className}: RecentTrafficChartProps
 
     return {
       barData: rows,
-      summary: {total, errors, peak, peakHour, successLabel, errorLabel},
-      themeColors: {
-        axis,
-        grid,
-        successHex,
-        errorHex,
-      },
+      summary: {total, errors, peak, peakHour},
       totalByKey,
     }
-  }, [traffic, t])
+  }, [traffic, labels.success, labels.error])
 
   // tooltipConfig wires the G2 v5 stacked-column tooltip.
 //
@@ -142,6 +150,7 @@ export function RecentTrafficChart({traffic, className}: RecentTrafficChartProps
 const tooltipConfig = useMemo(
     () => ({
       shared: false,
+      showCrosshairs: true,
       title: (d: {hour: string}) => d.hour,
       customContent: (title: string, _items: unknown[]) => {
         const entry = totalByKey.get(title)
@@ -158,13 +167,13 @@ const tooltipConfig = useMemo(
   <div class="g2-tooltip-title">${title}</div>
   <ul class="g2-tooltip-list" style="margin:0;padding:0;list-style:none;">
     <li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;">
-      <span class="g2-tooltip-marker" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${themeColors.successHex};"></span>
-      <span style="flex:1;">${summary.successLabel}</span>
+      <span class="g2-tooltip-marker" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${themeTokens.successHex};"></span>
+      <span style="flex:1;">${labels.success}</span>
       <span>${formatNumber(success)}</span>
     </li>
     <li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;">
-      <span class="g2-tooltip-marker" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${themeColors.errorHex};"></span>
-      <span style="flex:1;">${summary.errorLabel}</span>
+      <span class="g2-tooltip-marker" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${themeTokens.errorHex};"></span>
+      <span style="flex:1;">${labels.error}</span>
       <span>${formatNumber(errors)}</span>
     </li>
     <li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;margin-top:4px;border-top:1px solid rgba(0,0,0,0.08);padding-top:4px;">
@@ -175,7 +184,7 @@ const tooltipConfig = useMemo(
 </div>`
       },
     }),
-    [totalByKey, summary.successLabel, summary.errorLabel, themeColors.successHex, themeColors.errorHex, t],
+    [totalByKey, labels.success, labels.error, themeTokens.successHex, themeTokens.errorHex, t],
   )
 
   const interactionConfig = useMemo(
@@ -183,7 +192,7 @@ const tooltipConfig = useMemo(
       tooltip: {
         crosshairs: {
           type: 'x' as const,
-          lineStroke: themeColors.axis,
+          lineStroke: themeTokens.axis,
           lineStrokeOpacity: 0.45,
           lineLineDash: [3, 3],
           lineWidth: 1,
@@ -226,51 +235,31 @@ const tooltipConfig = useMemo(
         borderRadius: 4,
       },
     }),
-    [themeColors.axis],
+    [themeTokens.axis],
   )
 
-  // ChartCard is a thin wrapper around antd Card. The flowing border
-// effect lives on each MetricCell (the three KPI cards inside), so
-// the outer card stays a plain static outline.
-function ChartCard({
-  title,
-  children,
-  className,
-}: {
-  title: string
-  children: ReactNode
-  className?: string
-}) {
-  return (
-    <Card title={title} variant="outlined" className={className}>
-      {children}
-    </Card>
-  )
-}
+  // Animation: default G2 enter is 800ms which makes a 2s heartbeat
+  // feel like the chart is constantly repainting. 300ms keeps the
+  // animation perceptible while staying out of the way.
+  const animateConfig = useMemo(() => ({enter: {duration: 300}}), [])
 
-if (traffic.length === 0) {
+  const title = t('dashboard.recentTraffic')
+  const description = t('dashboard.recentTrafficDesc')
+
+  if (traffic.length === 0) {
     return (
-      <ChartCard title={t('dashboard.recentTraffic')} className={className}>
-        <Typography.Text type="secondary" className="block">
-          {t('dashboard.recentTrafficDesc')}
-        </Typography.Text>
-        <div className="mt-5">
-          <EmptyState
-            icon={<LuZap className="size-10 mx-auto text-fg-subtle" />}
-            title={t('dashboard.noTraffic')}
-            description={t('dashboard.noTrafficDesc')}
-          />
-        </div>
+      <ChartCard title={title} description={description} className={className}>
+        <ChartEmpty
+          icon={<LuZap className="size-10 mx-auto text-fg-subtle" />}
+          title={t('dashboard.noTraffic')}
+          description={t('dashboard.noTrafficDesc')}
+        />
       </ChartCard>
     )
   }
 
   return (
-    <ChartCard title={t('dashboard.recentTraffic')} className={className}>
-      <Typography.Text type="secondary" className="block">
-        {t('dashboard.recentTrafficDesc')}
-      </Typography.Text>
-
+    <ChartCard title={title} description={description} className={className}>
       {/* KPI strip — three cells with a soft muted background and a tiny
        * accent dot at the top edge. Reads as a metrics strip rather than
        * a stat row, so the chart below isn't fighting for hierarchy. */}
@@ -278,12 +267,12 @@ if (traffic.length === 0) {
         <MetricCell
           label={t('dashboard.totalRequests')}
           value={formatNumber(summary.total)}
-          accent={themeColors.successHex}
+          accent={themeTokens.successHex}
         />
         <MetricCell
           label={t('logs.detail.error')}
           value={formatNumber(summary.errors)}
-          accent={themeColors.errorHex}
+          accent={themeTokens.errorHex}
           muted={summary.errors === 0}
         />
         <MetricCell
@@ -304,13 +293,14 @@ if (traffic.length === 0) {
           yField="count"
           stack
           colorField="status"
+          theme="classic"
           scale={{
             color: {
-              domain: [summary.successLabel, summary.errorLabel],
+              domain: [labels.success, labels.error],
               // G2 v5 paints into a canvas, so CSS var() values are NOT
               // resolved by the canvas context. Pass literal hex
               // strings resolved from the live antd theme tokens.
-              range: [themeColors.successHex, themeColors.errorHex],
+              range: [themeTokens.successHex, themeTokens.errorHex],
             },
             y: {
               domainMin: 0,
@@ -324,7 +314,7 @@ if (traffic.length === 0) {
               labelAutoRotate: false,
               labelAutoHide: true,
               labelFontSize: 10,
-              labelFill: themeColors.axis,
+              labelFill: themeTokens.axis,
               lineStroke: 'transparent',
               tickStroke: 'transparent',
             },
@@ -332,8 +322,8 @@ if (traffic.length === 0) {
               title: false,
               labelFormatter: (v: number) => formatNumber(Math.round(v)),
               labelFontSize: 10,
-              labelFill: themeColors.axis,
-              gridStroke: themeColors.grid,
+              labelFill: themeTokens.axis,
+              gridStroke: themeTokens.grid,
               gridStrokeWidth: 1,
               gridLineDash: [3, 4],
               lineStroke: 'transparent',
@@ -343,6 +333,7 @@ if (traffic.length === 0) {
           legend={false}
           tooltip={tooltipConfig}
           interaction={interactionConfig}
+          animate={animateConfig}
           style={{
             maxWidth: 18,
             radiusTopLeft: 4,
@@ -350,14 +341,15 @@ if (traffic.length === 0) {
           }}
           height={200}
           autoFit
+          aria-label={title}
         />
       </div>
 
       {/* Inline legend — sits below the chart instead of floating in the
        * legend corner, so we never collide with the y-axis labels. */}
       <div className="mt-3 flex items-center gap-5 text-xs text-fg-muted">
-        <LegendDot color={themeColors.successHex} label={summary.successLabel} />
-        <LegendDot color={themeColors.errorHex} label={summary.errorLabel} />
+        <LegendDot color={themeTokens.successHex} label={labels.success} />
+        <LegendDot color={themeTokens.errorHex} label={labels.error} />
         <span className="ml-auto">{t('dashboard.recent24h')}</span>
       </div>
     </ChartCard>
@@ -376,7 +368,7 @@ function MetricCell({
   sub?: string
   accent: string
   muted?: boolean
-}) {
+}): ReactNode {
   return (
     // BorderBeam needs a single DOM child whose position:relative
     // provides the host context, so we wrap the cell body in one
@@ -406,7 +398,7 @@ function MetricCell({
   )
 }
 
-function LegendDot({color, label}: {color: string; label: string}) {
+function LegendDot({color, label}: {color: string; label: string}): ReactNode {
   return (
     <span className="inline-flex items-center gap-1.5">
       <span

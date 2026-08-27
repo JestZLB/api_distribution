@@ -4,11 +4,48 @@ import {EventsOn} from '../../wailsjs/runtime/runtime'
 import type {Config, Provider, ModelAlias, ServerStatus, Stats, LogEntry, ClientKey} from '@/types'
 import {toWailsConfig, toWailsProvider, toWailsModelAlias, toWailsClientKey} from '@/lib/wails'
 
+/**
+ * Module-scoped cache of the in-flight `refreshStatsWithComparison`
+ * Promise. When the 2s `stats:changed` event fires while a manual
+ * refresh is already running (or two events fire back-to-back before
+ * the previous promise resolves), both callers get the same Promise
+ * instead of triggering two parallel Wails IPC round-trips.
+ *
+ * Stored outside the Zustand store because it carries no UI state —
+ * it's purely an execution dedup marker — and writing/reading it on
+ * every render would force unrelated subscribers to re-render.
+ */
+let inflightStatsRefresh: Promise<void> | null = null
+let inflightLogsRefresh: Promise<void> | null = null
+
+interface PeriodStats {
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  errors: number
+  avgLatency: number
+}
+
 interface StatsWithComparison extends Stats {
   prevRequests: number
   prevInputTokens: number
   prevOutputTokens: number
   prevAvgLatency: number
+  todayRequests: number
+  todayInputTokens: number
+  todayOutputTokens: number
+  todayErrors: number
+  todayAvgLatency: number
+  yesterdayRequests: number
+  yesterdayInputTokens: number
+  yesterdayOutputTokens: number
+  yesterdayErrors: number
+  yesterdayAvgLatency: number
+  allTime: PeriodStats
+  week: PeriodStats
+  prevWeek: PeriodStats
+  month: PeriodStats
+  prevMonth: PeriodStats
 }
 
 interface ConfigState {
@@ -87,7 +124,7 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
       const [status, statsWC, logs, providers, aliases] = await Promise.all([
         App.GetServerStatus(),
         App.GetStatsWithComparison().catch(() => App.GetStats()),
-        App.GetLogs(200),
+        App.GetLogs(300),
         App.ListProviders(),
         App.ListModelAliases(),
       ])
@@ -157,69 +194,107 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
   },
 
   async refreshStatsWithComparison() {
-    try {
-      const statsWC = await App.GetStatsWithComparison()
-      const nextStats: Stats = {
-        totalRequests: statsWC.totalRequests,
-        totalInputTokens: statsWC.totalInputTokens,
-        totalOutputTokens: statsWC.totalOutputTokens,
-        avgLatencyMs: statsWC.avgLatencyMs,
-        requestsByModel: statsWC.requestsByModel,
-        requestsByProvider: statsWC.requestsByProvider,
-        requestsByClientKey: statsWC.requestsByClientKey,
-        requestsByClientKeyRecent: statsWC.requestsByClientKeyRecent,
-        requestsByHour: statsWC.requestsByHour,
-        // Per-model hourly breakdown feeds the ModelTrendChart; without
-        // this copy the chart's `data` prop is permanently undefined.
-        requestsByHourByModel: statsWC.requestsByHourByModel,
-      } as unknown as Stats
-      // Compare against the previous stats; if nothing actually changed
-      // (same totals, same hourly shape) keep the existing reference so
-      // memoized selectors / useMemo caches downstream don't all
-      // invalidate on every 2s heartbeat. The store-equality check
-      // avoids a deep compare while still being cheap.
-      const prevStats = get().stats
-      if (statsShallowEqual(prevStats, nextStats)) {
-        set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
-      } else {
-        set({
-          stats: nextStats,
-          statsWithComparison: statsWC as unknown as StatsWithComparison,
-        })
-        set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
-      }
-    } catch (err) {
-      // Fallback to basic stats if comparison endpoint not available
+    // Inflight dedup: if a previous call is still resolving, return the
+    // same Promise so callers (heartbeat + manual button) share a single
+    // IPC round-trip instead of stacking two.
+    if (inflightStatsRefresh) return inflightStatsRefresh
+    const run = async (): Promise<void> => {
       try {
-        const stats = await App.GetStats()
+        const statsWC = await App.GetStatsWithComparison()
+        const nextStats: Stats = {
+          totalRequests: statsWC.totalRequests,
+          totalInputTokens: statsWC.totalInputTokens,
+          totalOutputTokens: statsWC.totalOutputTokens,
+          avgLatencyMs: statsWC.avgLatencyMs,
+          requestsByModel: statsWC.requestsByModel,
+          requestsByProvider: statsWC.requestsByProvider,
+          requestsByClientKey: statsWC.requestsByClientKey,
+          requestsByClientKeyRecent: statsWC.requestsByClientKeyRecent,
+          requestsByHour: statsWC.requestsByHour,
+          // Per-model hourly breakdown feeds the ModelTrendChart; without
+          // this copy the chart's `data` prop is permanently undefined.
+          requestsByHourByModel: statsWC.requestsByHourByModel,
+        } as unknown as Stats
+        // Compare against the previous stats; if nothing actually changed
+        // (same totals, same hourly shape) keep the existing reference so
+        // memoized selectors / useMemo caches downstream don't all
+        // invalidate on every 2s heartbeat. The store-equality check
+        // avoids a deep compare while still being cheap.
         const prevStats = get().stats
-        if (statsShallowEqual(prevStats, stats)) {
+        const prevWC = get().statsWithComparison
+        // The rolling consumption windows (7d / 30d and their previous
+        // periods) can change even when the all-time totals don't (e.g.
+        // the calendar day rolls over at midnight), so they are compared
+        // separately to avoid a stale dashboard.
+        const dayChanged =
+          !prevWC ||
+          prevWC.week?.requests !== statsWC.week?.requests ||
+          prevWC.week?.inputTokens !== statsWC.week?.inputTokens ||
+          prevWC.week?.outputTokens !== statsWC.week?.outputTokens ||
+          prevWC.prevWeek?.requests !== statsWC.prevWeek?.requests ||
+          prevWC.month?.requests !== statsWC.month?.requests ||
+          prevWC.month?.inputTokens !== statsWC.month?.inputTokens ||
+          prevWC.month?.outputTokens !== statsWC.month?.outputTokens ||
+          prevWC.prevMonth?.requests !== statsWC.prevMonth?.requests
+        if (statsShallowEqual(prevStats, nextStats) && !dayChanged) {
           set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
         } else {
-          set({stats})
+          set({
+            stats: nextStats,
+            statsWithComparison: statsWC as unknown as StatsWithComparison,
+          })
           set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
         }
-      } catch (innerErr) {
-        set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(innerErr)}}))
+      } catch (err) {
+        // Fallback to basic stats if comparison endpoint not available
+        try {
+          const stats = await App.GetStats()
+          const prevStats = get().stats
+          if (statsShallowEqual(prevStats, stats)) {
+            set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+          } else {
+            set({stats})
+            set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+          }
+        } catch (innerErr) {
+          set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(innerErr)}}))
+        }
       }
     }
+    inflightStatsRefresh = run().finally(() => {
+      // Always release the slot, even on rejection, so a later call can
+      // actually re-fetch instead of getting permanently stuck on a
+      // dead promise.
+      inflightStatsRefresh = null
+    })
+    return inflightStatsRefresh
   },
 
   async refreshLogs() {
-    try {
-      const logs = await App.GetLogs(200)
-      // Keep the previous logs reference when entries are unchanged so
-      // the logs table doesn't re-render every 3s poll for nothing.
-      const prevLogs = get().logs
-      if (logsEqual(prevLogs, logs)) {
-        set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
-      } else {
-        set({logs})
-        set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+    // Inflight dedup: the 3s logs heartbeat can fire while a manual
+    // clearLogs() / refresh is still in flight; both callers share the
+    // same Promise instead of triggering two IPCs.
+    if (inflightLogsRefresh) return inflightLogsRefresh
+    const run = async (): Promise<void> => {
+      try {
+        const logs = await App.GetLogs(300)
+        // Keep the previous logs reference when entries are unchanged so
+        // the logs table doesn't re-render every 3s poll for nothing.
+        const prevLogs = get().logs
+        if (logsEqual(prevLogs, logs)) {
+          set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+        } else {
+          set({logs})
+          set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+        }
+      } catch (err) {
+        set((s) => ({refreshErrors: {...s.refreshErrors, logs: String(err)}}))
       }
-    } catch (err) {
-      set((s) => ({refreshErrors: {...s.refreshErrors, logs: String(err)}}))
     }
+    inflightLogsRefresh = run().finally(() => {
+      inflightLogsRefresh = null
+    })
+    return inflightLogsRefresh
   },
 
   async refreshAll() {
@@ -227,7 +302,7 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
       const [status, statsWC, logs, providers, aliases] = await Promise.all([
         App.GetServerStatus(),
         App.GetStatsWithComparison().catch(() => App.GetStats()),
-        App.GetLogs(200),
+        App.GetLogs(300),
         App.ListProviders(),
         App.ListModelAliases(),
       ])

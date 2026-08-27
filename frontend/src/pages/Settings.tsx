@@ -57,7 +57,7 @@ export function Settings() {
 
   const [hostValue, setHostValue] = useState('')
   const [portValue, setPortValue] = useState(0)
-  const [logRetention, setLogRetention] = useState(7)
+  const [logRetention, setLogRetention] = useState(30)
   const [saving, setSaving] = useState(false)
   const [portError, setPortError] = useState<string | null>(null)
 
@@ -181,7 +181,7 @@ export function Settings() {
         serverHost: '127.0.0.1',
         serverPort: 8080,
         clientKeys: [],
-        logRetention: 7,
+        logRetention: 30,
         providers: [],
         modelAliases: [],
       }
@@ -287,7 +287,7 @@ export function Settings() {
         <Typography.Paragraph className="mt-2! mb-6! text-xs text-fg-muted!">   
           {t('settings.persistence.desc')}
         </Typography.Paragraph>
-        <Space direction="vertical" size="middle" className="w-full">
+        <Space orientation="vertical" size="middle" className="w-full">
           <div>
             <div className="text-xs text-fg-muted">{t('settings.configDir')}</div>
             <Space.Compact className="mt-1! w-full">

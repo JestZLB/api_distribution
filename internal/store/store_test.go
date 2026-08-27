@@ -1,10 +1,13 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"api_distribution/internal/types"
 )
@@ -206,14 +209,22 @@ func TestDailyPersistence_RoundTrip(t *testing.T) {
 		})
 	}
 
-	dir := t.TempDir()
-	if err := s.SaveDaily(dir, 0); err != nil {
+	if err := s.SaveDaily(0); err != nil {
 		t.Fatalf("SaveDaily: %v", err)
 	}
 
-	// A fresh store must recover the same totals from the per-date files.
-	s2 := New()
-	if err := s2.LoadAllDaily(dir); err != nil {
+	// A fresh store sharing the same SQLite file must recover the same
+	// totals from the daily_stats table.
+	dbFile := filepath.Join(t.TempDir(), "store.db")
+	if err := copyDB(s, dbFile); err != nil {
+		t.Fatalf("copy db: %v", err)
+	}
+	s2, err := Open(dbFile)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer s2.db.Close()
+	if err := s2.LoadAllDaily(); err != nil {
 		t.Fatalf("LoadAllDaily: %v", err)
 	}
 	st := s2.Stats()
@@ -235,16 +246,23 @@ func TestDailyRetention_PrunesOldDays(t *testing.T) {
 	old := now.Add(-30 * 24 * time.Hour)
 	s.Append(types.LogEntry{ID: "old", Timestamp: old.UnixNano()})
 
-	dir := t.TempDir()
-	if err := s.SaveDaily(dir, 7); err != nil {
+	if err := s.SaveDaily(7); err != nil {
 		t.Fatalf("SaveDaily: %v", err)
 	}
 
 	if st := s.Stats(); st.TotalRequests != 1 {
 		t.Errorf("TotalRequests after pruning = %d, want 1", st.TotalRequests)
 	}
-	if _, err := os.Stat(DailyPath(dir, dateKey(old.UnixNano()))); !os.IsNotExist(err) {
-		t.Errorf("old day file was not pruned (err=%v)", err)
+	// The old day must no longer be in s.days and in in the table.
+	if _, ok := s.days[dateKey(old.UnixNano())]; ok {
+		t.Errorf("old day was not pruned from in-memory days map")
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM daily_stats WHERE date = ?`, dateKey(old.UnixNano())).Scan(&n); err != nil {
+		t.Fatalf("count old day: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("old day row was not pruned (count=%d)", n)
 	}
 }
 
@@ -252,19 +270,28 @@ func TestClearDailyFiles_RemovesOnDiskAggregates(t *testing.T) {
 	s := New()
 	now := time.Now()
 	s.Append(types.LogEntry{ID: "x", Timestamp: now.UnixNano(), ClientKeyLabel: "k"})
-	dir := t.TempDir()
-	if err := s.SaveDaily(dir, 0); err != nil {
+	if err := s.SaveDaily(0); err != nil {
 		t.Fatalf("SaveDaily: %v", err)
 	}
-	ClearDailyFiles(dir)
+	s.ClearDaily()
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM daily_stats`).Scan(&n); err != nil {
+		t.Fatalf("count daily_stats: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Errorf("expected stats dir empty after ClearDailyFiles, got %d entries", len(entries))
+	if n != 0 {
+		t.Errorf("expected daily_stats empty after ClearDaily, got %d rows", n)
 	}
+}
+
+// copyDB streams every row of s.db (which is :memory: and dies when s
+// goes out of scope) into a fresh file-backed database so a second
+// Store can re-open and read it. We use SQLite's VACUUM INTO — the
+// simplest portable way and it avoids plumbing the modernc driver's
+// backup API into tests.
+func copyDB(s *Store, dst string) error {
+	_, err := s.db.Exec(`VACUUM INTO ?`, dst)
+	return err
 }
 
 // TestStats_RequestsByHourByModel_SplitByAlias verifies that
@@ -321,8 +348,9 @@ func TestStats_RequestsByHourByModel_SplitByAlias(t *testing.T) {
 
 // TestLoadAllDaily_LegacyJSONNoByModel verifies that a daily JSON file
 // written before the HourBucket.ByModel field existed still loads
-// cleanly: the legacy file omits byModel on each hour bucket, but the
-// loader must not error and the per-day totals must survive.
+// cleanly via the legacy-JSON migration: the legacy file omits
+// byModel on each hour bucket, but the loader must not error and the
+// per-day totals must survive.
 func TestLoadAllDaily_LegacyJSONNoByModel(t *testing.T) {
 	dir := t.TempDir()
 	statsDir := filepath.Join(dir, "stats")
@@ -336,7 +364,10 @@ func TestLoadAllDaily_LegacyJSONNoByModel(t *testing.T) {
 	}
 
 	s := New()
-	if err := s.LoadAllDaily(statsDir); err != nil {
+	if err := s.MigrateLegacyJSON(dir); err != nil {
+		t.Fatalf("MigrateLegacyJSON: %v", err)
+	}
+	if err := s.LoadAllDaily(); err != nil {
 		t.Fatalf("LoadAllDaily: %v", err)
 	}
 
@@ -356,5 +387,309 @@ func TestLoadAllDaily_LegacyJSONNoByModel(t *testing.T) {
 				t.Errorf("RequestsByHourByModel[%s][%d].Count = %d, want 0", alias, i, b.Count)
 			}
 		}
+	}
+}
+
+// TestStats_RequestsByHourByModel_TokenAggregation verifies that
+// RequestsByHourByModel carries a per-alias, per-hour token trend:
+// ByModelTokens[alias] equals that alias's input+output tokens for the
+// hour, and the inner InputTokens/OutputTokens mirror the alias's own
+// input/output (not the hour total). The emitted slices must be sorted
+// by hour ascending.
+func TestStats_RequestsByHourByModel_TokenAggregation(t *testing.T) {
+	s := New()
+	base := time.Now().Truncate(time.Hour)
+	h0 := base.Unix()
+	h1 := base.Add(time.Hour).Unix()
+
+	// alias-a spans two hours; alias-b only shares h0 with alias-a.
+	s.Append(types.LogEntry{ID: "a0", Timestamp: base.UnixNano(), Alias: "alias-a", InputTokens: 10, OutputTokens: 5})
+	s.Append(types.LogEntry{ID: "a1", Timestamp: base.Add(time.Hour).UnixNano(), Alias: "alias-a", InputTokens: 20, OutputTokens: 8})
+	s.Append(types.LogEntry{ID: "b0", Timestamp: base.UnixNano(), Alias: "alias-b", InputTokens: 100, OutputTokens: 50})
+
+	stats := s.Stats()
+	if stats.RequestsByHourByModel == nil {
+		t.Fatal("RequestsByHourByModel is nil")
+	}
+	if got := len(stats.RequestsByHourByModel); got != 2 {
+		t.Fatalf("len(RequestsByHourByModel) = %d, want 2", got)
+	}
+
+	ab, ok := stats.RequestsByHourByModel["alias-a"]
+	if !ok {
+		t.Fatal(`missing "alias-a" key in RequestsByHourByModel`)
+	}
+	if len(ab) != 2 {
+		t.Fatalf("alias-a buckets = %d, want 2", len(ab))
+	}
+	// Sorted by hour ascending.
+	if ab[0].Hour != h0 || ab[1].Hour != h1 {
+		t.Fatalf("alias-a hours = [%d,%d], want [%d,%d]", ab[0].Hour, ab[1].Hour, h0, h1)
+	}
+	// h0: in 10, out 5 => total 15.
+	if got := ab[0].ByModelTokens["alias-a"]; got != 15 {
+		t.Errorf(`alias-a h0 byModelTokens["alias-a"] = %d, want 15`, got)
+	}
+	if ab[0].InputTokens != 10 || ab[0].OutputTokens != 5 {
+		t.Errorf("alias-a h0 input/output = %d/%d, want 10/5", ab[0].InputTokens, ab[0].OutputTokens)
+	}
+	// h1: in 20, out 8 => total 28.
+	if got := ab[1].ByModelTokens["alias-a"]; got != 28 {
+		t.Errorf(`alias-a h1 byModelTokens["alias-a"] = %d, want 28`, got)
+	}
+	if ab[1].InputTokens != 20 || ab[1].OutputTokens != 8 {
+		t.Errorf("alias-a h1 input/output = %d/%d, want 20/8", ab[1].InputTokens, ab[1].OutputTokens)
+	}
+
+	bb, ok := stats.RequestsByHourByModel["alias-b"]
+	if !ok {
+		t.Fatal(`missing "alias-b" key in RequestsByHourByModel`)
+	}
+	if len(bb) != 1 {
+		t.Fatalf("alias-b buckets = %d, want 1", len(bb))
+	}
+	// h0: in 100, out 50 => total 150.
+	if got := bb[0].ByModelTokens["alias-b"]; got != 150 {
+		t.Errorf(`alias-b byModelTokens["alias-b"] = %d, want 150`, got)
+	}
+	if bb[0].InputTokens != 100 || bb[0].OutputTokens != 50 {
+		t.Errorf("alias-b input/output = %d/%d, want 100/50", bb[0].InputTokens, bb[0].OutputTokens)
+	}
+}
+
+// TestStats_RequestsByHourByModel_CrossDayTokenSum verifies that token
+// usage for the same alias across two different calendar days is summed
+// into the per-hour buckets without double counting.
+func TestStats_RequestsByHourByModel_CrossDayTokenSum(t *testing.T) {
+	s := New()
+	yesterday := time.Now().Add(-25 * time.Hour).Truncate(time.Hour)
+	today := time.Now().Truncate(time.Hour)
+
+	s.Append(types.LogEntry{ID: "y", Timestamp: yesterday.UnixNano(), Alias: "alias-a", InputTokens: 1, OutputTokens: 2})
+	s.Append(types.LogEntry{ID: "t", Timestamp: today.UnixNano(), Alias: "alias-a", InputTokens: 3, OutputTokens: 4})
+
+	stats := s.Stats()
+	ab, ok := stats.RequestsByHourByModel["alias-a"]
+	if !ok {
+		t.Fatal(`missing "alias-a" key in RequestsByHourByModel`)
+	}
+	if len(ab) != 2 {
+		t.Fatalf("alias-a buckets = %d, want 2 (one per day)", len(ab))
+	}
+	if ab[0].Hour >= ab[1].Hour {
+		t.Fatalf("alias-a buckets not ascending: [%d,%d]", ab[0].Hour, ab[1].Hour)
+	}
+	var total int64
+	for _, b := range ab {
+		total += b.ByModelTokens["alias-a"]
+	}
+	if total != 10 {
+		t.Errorf("cross-day total byModelTokens = %d, want 10", total)
+	}
+	// Each hour independently: (1+2)=3 and (3+4)=7.
+	if ab[0].ByModelTokens["alias-a"] != 3 || ab[1].ByModelTokens["alias-a"] != 7 {
+		t.Errorf("per-hour byModelTokens = [%d,%d], want [3,7]",
+			ab[0].ByModelTokens["alias-a"], ab[1].ByModelTokens["alias-a"])
+	}
+}
+
+// TestLoadAllDaily_LegacyJSONNoTokenFields verifies that a daily JSON
+// file written before the HourBucket token fields existed still loads
+// cleanly via the legacy-JSON migration: the legacy file omits
+// inputTokens/outputTokens/byModelTokens on each hour bucket, but the
+// loader must not error and token fields must default to 0 / a non-nil
+// empty map.
+func TestLoadAllDaily_LegacyJSONNoTokenFields(t *testing.T) {
+	dir := t.TempDir()
+	statsDir := filepath.Join(dir, "stats")
+	if err := os.MkdirAll(statsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// Legacy schema: hour bucket carries byModel but no token fields.
+	base := time.Now().Truncate(time.Hour)
+	dateStr := base.Format("2006-01-02")
+	hour := base.Unix()
+	body := []byte(fmt.Sprintf(`{"date":%q,"totalRequests":3,"totalInputTokens":0,"totalOutputTokens":0,"errors":0,"latencySumMs":0,"byModel":{"foo":3},"byProvider":{},"byClientKey":{},"byHour":{"%d":{"hour":%d,"count":3,"errors":0,"byModel":{"foo":3}}}}`, dateStr, hour, hour))
+	if err := os.WriteFile(filepath.Join(statsDir, "2026-08-02.json"), body, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	s := New()
+	if err := s.MigrateLegacyJSON(dir); err != nil {
+		t.Fatalf("MigrateLegacyJSON: %v", err)
+	}
+	if err := s.LoadAllDaily(); err != nil {
+		t.Fatalf("LoadAllDaily: %v", err)
+	}
+
+	stats := s.Stats()
+	if stats.TotalRequests != 3 {
+		t.Errorf("TotalRequests = %d, want 3", stats.TotalRequests)
+	}
+	buckets, ok := stats.RequestsByHourByModel["foo"]
+	if !ok {
+		t.Fatal(`missing "foo" key in RequestsByHourByModel`)
+	}
+	if len(buckets) != 1 {
+		t.Fatalf("foo buckets = %d, want 1", len(buckets))
+	}
+	b := buckets[0]
+	if b.Count != 3 {
+		t.Errorf("foo[0].Count = %d, want 3", b.Count)
+	}
+	if b.InputTokens != 0 || b.OutputTokens != 0 {
+		t.Errorf("foo[0] input/output = %d/%d, want 0/0", b.InputTokens, b.OutputTokens)
+	}
+	if b.ByModelTokens == nil {
+		t.Error("foo[0].ByModelTokens is nil")
+	}
+	if got := b.ByModelTokens["foo"]; got != 0 {
+		t.Errorf(`foo[0].byModelTokens["foo"] = %d, want 0`, got)
+	}
+}
+
+// TestStatsWithComparison_TodayVsYesterday verifies that
+// StatsWithComparison splits the per-date aggregates into today vs the
+// previous full calendar day, and that Prev* mirror Yesterday* for
+// backward compatibility.
+func TestStatsWithComparison_TodayVsYesterday(t *testing.T) {
+	s := New()
+	now := time.Now()
+	yesterday := now.Add(-24 * time.Hour)
+	s.Append(types.LogEntry{ID: "t1", Timestamp: now.UnixNano(), Alias: "a", InputTokens: 100, OutputTokens: 50, StatusCode: 200})
+	s.Append(types.LogEntry{ID: "t2", Timestamp: now.UnixNano(), Alias: "a", InputTokens: 200, OutputTokens: 100, StatusCode: 500})
+	s.Append(types.LogEntry{ID: "y1", Timestamp: yesterday.UnixNano(), Alias: "a", InputTokens: 300, OutputTokens: 150, StatusCode: 200})
+
+	sc := s.StatsWithComparison()
+	if sc.TodayRequests != 2 {
+		t.Errorf("TodayRequests = %d, want 2", sc.TodayRequests)
+	}
+	if sc.TodayInputTokens != 300 {
+		t.Errorf("TodayInputTokens = %d, want 300", sc.TodayInputTokens)
+	}
+	if sc.TodayOutputTokens != 150 {
+		t.Errorf("TodayOutputTokens = %d, want 150", sc.TodayOutputTokens)
+	}
+	if sc.TodayErrors != 1 {
+		t.Errorf("TodayErrors = %d, want 1", sc.TodayErrors)
+	}
+	if sc.YesterdayRequests != 1 {
+		t.Errorf("YesterdayRequests = %d, want 1", sc.YesterdayRequests)
+	}
+	if sc.YesterdayInputTokens != 300 {
+		t.Errorf("YesterdayInputTokens = %d, want 300", sc.YesterdayInputTokens)
+	}
+	if sc.YesterdayOutputTokens != 150 {
+		t.Errorf("YesterdayOutputTokens = %d, want 150", sc.YesterdayOutputTokens)
+	}
+	if sc.YesterdayErrors != 0 {
+		t.Errorf("YesterdayErrors = %d, want 0", sc.YesterdayErrors)
+	}
+	// Prev* mirror yesterday for backward compatibility.
+	if sc.PrevRequests != sc.YesterdayRequests {
+		t.Errorf("PrevRequests = %d, want %d", sc.PrevRequests, sc.YesterdayRequests)
+	}
+	if sc.PrevInputTokens != sc.YesterdayInputTokens {
+		t.Errorf("PrevInputTokens = %d, want %d", sc.PrevInputTokens, sc.YesterdayInputTokens)
+	}
+	if sc.PrevOutputTokens != sc.YesterdayOutputTokens {
+		t.Errorf("PrevOutputTokens = %d, want %d", sc.PrevOutputTokens, sc.YesterdayOutputTokens)
+	}
+}
+
+// TestDailyPersistence_TokenRoundTrip verifies that the SQLite store
+// round-trips the token aggregates: after SaveDaily into a fresh file
+// + LoadAllDaily, the day-level input/output totals and the
+// per-alias hourly byModelTokens survive a restart.
+func TestDailyPersistence_TokenRoundTrip(t *testing.T) {
+	s := New()
+	now := time.Now()
+	// gpt totals 300 tokens (in 200 / out 100); claude totals 450.
+	s.Append(types.LogEntry{ID: "a1", Timestamp: now.UnixNano(), Alias: "gpt", InputTokens: 100, OutputTokens: 50, StatusCode: 200})
+	s.Append(types.LogEntry{ID: "a2", Timestamp: now.UnixNano(), Alias: "gpt", InputTokens: 100, OutputTokens: 50, StatusCode: 200})
+	s.Append(types.LogEntry{ID: "b1", Timestamp: now.UnixNano(), Alias: "claude", InputTokens: 300, OutputTokens: 150, StatusCode: 200})
+
+	if err := s.SaveDaily(0); err != nil {
+		t.Fatalf("SaveDaily: %v", err)
+	}
+
+	// A fresh store sharing the same SQLite file must recover the same
+	// token totals from the daily_stats table.
+	dbFile := filepath.Join(t.TempDir(), "store.db")
+	if err := copyDB(s, dbFile); err != nil {
+		t.Fatalf("copy db: %v", err)
+	}
+	s2, err := Open(dbFile)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer s2.db.Close()
+	if err := s2.LoadAllDaily(); err != nil {
+		t.Fatalf("LoadAllDaily: %v", err)
+	}
+	st := s2.Stats()
+	if st.TotalInputTokens != 500 {
+		t.Errorf("TotalInputTokens after reload = %d, want 500", st.TotalInputTokens)
+	}
+	if st.TotalOutputTokens != 250 {
+		t.Errorf("TotalOutputTokens after reload = %d, want 250", st.TotalOutputTokens)
+	}
+	gpt := st.RequestsByHourByModel["gpt"]
+	if len(gpt) != 1 {
+		t.Fatalf("gpt buckets = %d, want 1", len(gpt))
+	}
+	if got := gpt[0].ByModelTokens["gpt"]; got != 300 {
+		t.Errorf(`gpt[0].byModelTokens["gpt"] = %d, want 300`, got)
+	}
+	claude := st.RequestsByHourByModel["claude"]
+	if len(claude) != 1 {
+		t.Fatalf("claude buckets = %d, want 1", len(claude))
+	}
+	if got := claude[0].ByModelTokens["claude"]; got != 450 {
+		t.Errorf(`claude[0].byModelTokens["claude"] = %d, want 450`, got)
+	}
+}
+
+// TestStatsWithComparison_RollingWindows verifies the all-time / 7-day /
+// 30-day consumption windows and their previous-period counterparts.
+func TestStatsWithComparison_RollingWindows(t *testing.T) {
+	s := New()
+	now := time.Now()
+	// Today: inside the 7-day and 30-day windows.
+	s.Append(types.LogEntry{ID: "d0", Timestamp: now.UnixNano(), Alias: "a", InputTokens: 100, OutputTokens: 50, StatusCode: 200})
+	// 3 days ago: inside the 7-day and 30-day windows.
+	s.Append(types.LogEntry{ID: "d3", Timestamp: now.AddDate(0, 0, -3).UnixNano(), Alias: "a", InputTokens: 200, OutputTokens: 100, StatusCode: 200})
+	// 10 days ago: in prev 7-day window and the 30-day window.
+	s.Append(types.LogEntry{ID: "d10", Timestamp: now.AddDate(0, 0, -10).UnixNano(), Alias: "a", InputTokens: 300, OutputTokens: 150, StatusCode: 200})
+	// 40 days ago: outside the 30-day window, inside prev 30-day window.
+	s.Append(types.LogEntry{ID: "d40", Timestamp: now.AddDate(0, 0, -40).UnixNano(), Alias: "a", InputTokens: 400, OutputTokens: 200, StatusCode: 200})
+
+	sc := s.StatsWithComparison()
+	if sc.AllTime.Requests != 4 {
+		t.Errorf("AllTime.Requests = %d, want 4", sc.AllTime.Requests)
+	}
+	if sc.Week.Requests != 2 {
+		t.Errorf("Week.Requests = %d, want 2", sc.Week.Requests)
+	}
+	if sc.Week.InputTokens != 300 || sc.Week.OutputTokens != 150 {
+		t.Errorf("Week tokens = %d/%d, want 300/150", sc.Week.InputTokens, sc.Week.OutputTokens)
+	}
+	if sc.PrevWeek.Requests != 1 {
+		t.Errorf("PrevWeek.Requests = %d, want 1", sc.PrevWeek.Requests)
+	}
+	if sc.PrevWeek.InputTokens != 300 || sc.PrevWeek.OutputTokens != 150 {
+		t.Errorf("PrevWeek tokens = %d/%d, want 300/150", sc.PrevWeek.InputTokens, sc.PrevWeek.OutputTokens)
+	}
+	if sc.Month.Requests != 3 {
+		t.Errorf("Month.Requests = %d, want 3", sc.Month.Requests)
+	}
+	if sc.Month.InputTokens != 600 || sc.Month.OutputTokens != 300 {
+		t.Errorf("Month tokens = %d/%d, want 600/300", sc.Month.InputTokens, sc.Month.OutputTokens)
+	}
+	if sc.PrevMonth.Requests != 1 {
+		t.Errorf("PrevMonth.Requests = %d, want 1", sc.PrevMonth.Requests)
+	}
+	if sc.PrevMonth.InputTokens != 400 || sc.PrevMonth.OutputTokens != 200 {
+		t.Errorf("PrevMonth tokens = %d/%d, want 400/200", sc.PrevMonth.InputTokens, sc.PrevMonth.OutputTokens)
 	}
 }

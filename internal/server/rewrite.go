@@ -94,17 +94,50 @@ func isStreaming(body []byte) bool {
 
 // parseUsage extracts token counts from a non-streaming OpenAI-style
 // response. Returns (0,0) if the field is missing or unparsable.
-func parseUsage(body []byte) (input, output int) {
+//
+// The probe fields are int64 (matching Stats / DailyAgg) so a hostile
+// upstream returning values beyond int32 cannot wrap into negative
+// numbers and corrupt totals.
+func parseUsage(body []byte) (input, output int64) {
 	var probe struct {
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &probe) != nil {
 		return 0, 0
 	}
 	return probe.Usage.PromptTokens, probe.Usage.CompletionTokens
+}
+
+// ensureStreamUsage guarantees the OpenAI request body carries
+// `stream_options.include_usage=true`. OpenAI only emits `usage` in the
+// final SSE chunk of a streaming chat completion when the caller sets
+// this flag, so we inject it on the forwarding path to keep streamed
+// token accounting accurate.
+//
+// If `stream_options` already exists we merge into it, preserving any
+// other fields the client sent (e.g. parallel_tool_calls). On parse
+// failure the original bytes are returned untouched.
+func ensureStreamUsage(body []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+
+	so, _ := m["stream_options"].(map[string]any)
+	if so == nil {
+		so = make(map[string]any)
+	}
+	so["include_usage"] = true
+	m["stream_options"] = so
+
+	out, err := jsonMarshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // jsonMarshal is split out so tests can stub it if needed.

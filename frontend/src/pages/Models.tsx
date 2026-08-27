@@ -9,7 +9,7 @@ import {
   LuSparkles,
   LuTrash2,
 } from 'react-icons/lu'
-import {App as AntApp, Badge, Button, Card, Collapse, Divider, Drawer, Form, Input, List, Select, Space, Switch, Typography} from 'antd'
+import {App as AntApp, Badge, Button, Card, Collapse, Divider, Drawer, Form, Input, Select, Space, Switch, Typography} from 'antd'
 import {PageHeader} from '@/components/layout/PageHeader'
 import {EmptyState} from '@/components/ui/EmptyState'
 import {useConfigStore} from '@/store/config'
@@ -106,7 +106,7 @@ export function Models() {
     modal.confirm({
       title: t('models.modal.deleteTitle'),
       content: (
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <span>{t('models.modal.deleteDesc', {alias: alias.alias})}</span>
           <span>
             {t('models.modal.deleteBodyBefore')} <Typography.Text code>{alias.alias}</Typography.Text> {t('models.modal.deleteBodyAfter')}
@@ -204,60 +204,54 @@ export function Models() {
         )
       ) : (
         <Card>
-          <List
-            dataSource={filtered}
-            split
-            renderItem={(alias) => {
+          <div className="divide-y divide-border">
+            {filtered.map((alias) => {
               const provider = providerById.get(alias.providerId)
               return (
-                <List.Item
-                  actions={[
-                    <Space key="ops" size={4} className="items-center">
-                      <Switch
-                        checked={alias.enabled}
-                        onChange={(v) => upsertModelAlias({...alias, enabled: v})}
-                      />
-                      <Button
-                        size="small"
-                        onClick={() => setEditing(alias)}
-                        icon={<LuPencil className="size-3.5" />}
-                      >
-                        {t('common.edit')}
-                      </Button>
-                      <Button
-                        size="small"
-                        type="text"
-                        aria-label="Delete alias"
-                        onClick={() => confirmDelete(alias)}
-                        danger
-                        icon={<LuTrash2 className="size-3.5" />}
-                      />
-                    </Space>,
-                  ]}
+                <div
+                  key={alias.id}
+                  className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between"
                 >
-                  <List.Item.Meta
-                    title={
-                      <Space wrap size={6}>
-                        <Typography.Text code className="text-sm!">
-                          {alias.alias || t('models.unnamed')}
-                        </Typography.Text>
-                        {alias.tags.map((tag) => (
-                          <Badge key={tag} color="blue" text={tag} />
-                        ))}
-                      </Space>
-                    }
-                    description={
-                      <Typography.Text type="secondary" className="text-sm!">
-                        {provider?.name ?? t('dashboard.unknownProvider')}
-                        <span className="mx-1 text-fg-subtle">→</span>
-                        <span className="font-mono">{alias.providerModel || '—'}</span>
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <Space wrap size={6}>
+                      <Typography.Text code className="text-sm!">
+                        {alias.alias || t('models.unnamed')}
                       </Typography.Text>
-                    }
-                  />
-                </List.Item>
+                      {alias.tags.map((tag) => (
+                        <Badge key={tag} color="blue" text={tag} />
+                      ))}
+                    </Space>
+                    <Typography.Paragraph type="secondary" className="text-sm! m-0!">
+                      {provider?.name ?? t('dashboard.unknownProvider')}
+                      <span className="mx-1 text-fg-subtle">→</span>
+                      <span className="font-mono">{alias.providerModel || '—'}</span>
+                    </Typography.Paragraph>
+                  </div>
+                  <Space size={4} className="items-center">
+                    <Switch
+                      checked={alias.enabled}
+                      onChange={(v) => upsertModelAlias({...alias, enabled: v})}
+                    />
+                    <Button
+                      size="small"
+                      onClick={() => setEditing(alias)}
+                      icon={<LuPencil className="size-3.5" />}
+                    >
+                      {t('common.edit')}
+                    </Button>
+                    <Button
+                      size="small"
+                      type="text"
+                      aria-label="Delete alias"
+                      onClick={() => confirmDelete(alias)}
+                      danger
+                      icon={<LuTrash2 className="size-3.5" />}
+                    />
+                  </Space>
+                </div>
               )
-            }}
-          />
+            })}
+          </div>
         </Card>
       )}
 
@@ -310,7 +304,7 @@ export function Models() {
         open={editing !== null}
         onClose={() => setEditing(null)}
         title={editing && modelAliases.some((m) => m.id === editing.id) ? t('models.drawer.edit') : t('models.drawer.new')}
-        width={drawerWidth}
+        size={drawerWidth}
         styles={{body: {padding: '24px 32px'}}}
       >
         {editing && (

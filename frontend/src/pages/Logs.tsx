@@ -1,4 +1,4 @@
-import {useEffect, useMemo, useRef, useState} from 'react'
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import {
   LuChevronDown,
   LuChevronRight,
@@ -60,7 +60,7 @@ export function Logs() {
   // filtered list / table re-renders after a 200ms pause.
   const debouncedQuery = useDebouncedValue(query, 200)
 
-  const topRef = useRef<HTMLDivElement | null>(null)
+  const tableBodyRef = useRef<HTMLElement | null>(null)
   const lastLogCount = useRef(logs.length)
   const stickyTop = useRef(true)
   const pollTimerRef = useRef<number | null>(null)
@@ -128,25 +128,26 @@ export function Logs() {
   }, [paused, refreshLogs])
 
   // Detect whether the user is at the top so we can auto-scroll on new logs.
-  useEffect(() => {
-    const node = topRef.current
-    if (!node) return
-    const handler = () => {
-      stickyTop.current = node.scrollTop < 16
-    }
-    node.addEventListener('scroll', handler)
-    return () => {
-      node.removeEventListener('scroll', handler)
-      topRef.current = null
-    }
-  }, [])
-
+  // With the virtual Table the scroll container is `.ant-table-body`,
+  // not a wrapper we own, so we capture it via the Table `onScroll`
+  // callback in `handleTableScroll` rather than attaching a listener
+  // directly to a DOM node we control.
   useEffect(() => {
     if (!paused && stickyTop.current && logs.length > lastLogCount.current) {
-      topRef.current?.scrollTo({top: 0, behavior: 'smooth'})
+      tableBodyRef.current?.scrollTo({top: 0, behavior: 'smooth'})
     }
     lastLogCount.current = logs.length
   }, [logs, paused])
+
+  const handleTableScroll = useCallback(
+    (info: {currentTarget?: HTMLElement; scrollLeft?: number}) => {
+      const node = info.currentTarget
+      if (!node) return
+      tableBodyRef.current = node
+      stickyTop.current = node.scrollTop < 16
+    },
+    [],
+  )
 
   const filtered = useMemo(() => {
     const q = debouncedQuery.trim().toLowerCase()
@@ -173,7 +174,7 @@ export function Logs() {
     modal.confirm({
       title: t('logs.modal.clearTitle'),
       content: (
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <span>{t('logs.modal.clearDesc')}</span>
           <span>{t('logs.modal.clearBody')}</span>
         </Space>
@@ -287,7 +288,7 @@ export function Logs() {
         icon={expanded ? <LuChevronDown className="size-3.5" /> : <LuChevronRight className="size-3.5" />}
       />
     ),
-    render: (record: LogEntry) => {
+    expandedRowRender: (record: LogEntry) => {
       const {tone, label} = statusBadge(record.statusCode, record.error, t)
       return (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
@@ -347,7 +348,7 @@ export function Logs() {
           showIcon
           message={t('logs.banner.stale')}
           description={
-            <Space direction="vertical" size={0}>
+            <Space orientation="vertical" size={0}>
               <span>{logsError}</span>
               <span className="text-fg-muted!">
                 {lastLoadedAt
@@ -403,10 +404,7 @@ export function Logs() {
         </div>
       </Card>
 
-      <div
-        ref={topRef}
-        className="max-h-[60vh] overflow-x-auto overflow-y-auto"
-      >
+      <div>
         {filtered.length === 0 ? (
           <Card>
             <EmptyState
@@ -422,7 +420,15 @@ export function Logs() {
             dataSource={filtered}
             pagination={false}
             size="middle"
+            // `virtual` swaps the `<tbody>` for `rc-virtual-list`,
+            // rendering only the rows in view + a small buffer. Without
+            // this, expanding any row triggers a full-table reflow over
+            // every rendered row, which is the main source of the
+            // expansion lag on a 300-row buffer.
+            virtual
+            scroll={{x: 1000, y: 380}}
             expandable={expandable}
+            onScroll={handleTableScroll}
           />
         )}
       </div>

@@ -87,8 +87,8 @@ func TestIsStreaming(t *testing.T) {
 func TestParseUsage(t *testing.T) {
 	cases := []struct {
 		body    string
-		wantIn  int
-		wantOut int
+		wantIn  int64
+		wantOut int64
 	}{
 		{`{"usage":{"prompt_tokens":11,"completion_tokens":22}}`, 11, 22},
 		{`{}`, 0, 0},

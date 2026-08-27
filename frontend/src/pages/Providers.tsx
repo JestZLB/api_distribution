@@ -242,7 +242,7 @@ export function Providers() {
         open={editing !== null}
         onClose={tryCloseEditor}
         title={editing && providers.some((p) => p.id === editing.id) ? t('providers.drawer.edit') : t('providers.drawer.new')}
-        width={drawerWidth}
+        size={drawerWidth}
         styles={{body: {padding: '24px 32px'}}}
         extra={
           editing ? (

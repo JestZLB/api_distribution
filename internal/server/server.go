@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	stdlog "log"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -324,6 +325,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	cli := upstream.GetOrCreate(resolved.Provider)
 	ctx := r.Context()
 
+	// For streaming OpenAI requests, ensure the upstream returns `usage`
+	// in the final SSE chunk by injecting stream_options.include_usage.
+	if streaming {
+		body = ensureStreamUsage(body)
+	}
+
 	start := time.Now()
 	var resp *http.Response
 	var doErr error
@@ -463,9 +470,15 @@ func (s *Server) handleAnthropicChat(
 	log.StatusCode = resp.StatusCode
 
 	if streaming {
-		if err := anthropicconv.TransformStream(resp.Body, w); err != nil && !isClientDisconnect(err) {
+		usage, err := anthropicconv.TransformStream(resp.Body, w)
+		if err != nil && !isClientDisconnect(err) {
 			log.Error = err.Error()
 			atomic.AddInt64(&s.status.ErrorCount, 1)
+		} else if err == nil {
+			// Clamp to int32 to avoid int wrap-around on hostile input,
+			// mirroring the non-streaming path's usage backfill.
+			log.InputTokens = clampToInt32(usage.InputTokens)
+			log.OutputTokens = clampToInt32(usage.OutputTokens)
 		}
 	} else {
 		usage, err := anthropicconv.TransformResponse(resp.Body, w)
@@ -473,8 +486,9 @@ func (s *Server) handleAnthropicChat(
 			log.Error = err.Error()
 			atomic.AddInt64(&s.status.ErrorCount, 1)
 		} else if err == nil {
-			log.InputTokens = usage.InputTokens
-			log.OutputTokens = usage.OutputTokens
+			// Clamp to int32 to avoid int wrap-around on hostile input.
+			log.InputTokens = clampToInt32(usage.InputTokens)
+			log.OutputTokens = clampToInt32(usage.OutputTokens)
 		}
 	}
 
@@ -532,13 +546,16 @@ func (s *Server) streamResponseWithUsage(w http.ResponseWriter, src io.Reader, l
 		// Try to parse usage from the chunk.
 		var chunk struct {
 			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err == nil && chunk.Usage != nil {
-			log.InputTokens = chunk.Usage.PromptTokens
-			log.OutputTokens = chunk.Usage.CompletionTokens
+			// Clamp to int32 before storing into LogEntry's int32 fields
+			// so a hostile upstream returning 1e20 cannot wrap into a
+			// negative int and corrupt daily totals.
+			log.InputTokens = clampToInt32(chunk.Usage.PromptTokens)
+			log.OutputTokens = clampToInt32(chunk.Usage.CompletionTokens)
 		}
 
 		// Write the original line to the client.
@@ -569,14 +586,32 @@ func (s *Server) streamResponseWithUsage(w http.ResponseWriter, src io.Reader, l
 func (s *Server) collectNonStream(body []byte, log *types.LogEntry) {
 	// Best-effort: pull prompt/completion token counts from OpenAI-style response.
 	// Not provider-agnostic — left as a future improvement.
+	// Clamp to int32 range so a hostile upstream returning 1e20 cannot
+	// wrap into a negative int and corrupt the daily totals.
 	in, out := parseUsage(body)
-	log.InputTokens = in
-	log.OutputTokens = out
+	log.InputTokens = clampToInt32(in)
+	log.OutputTokens = clampToInt32(out)
 }
 
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+// clampToInt32 clamps a token count into the int32 range that
+// LogEntry.InputTokens / OutputTokens can hold. Values above
+// math.MaxInt32 are saturated to MaxInt32; negative values (which
+// token counts must never legitimately be) are clamped to 0 so a
+// hostile upstream cannot inject a negative daily total via the
+// int32 wrap-around.
+func clampToInt32(v int64) int {
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int(v)
+}
 
 // readRequestBody reads the request body with a hard size limit to
 // prevent memory exhaustion from malicious or misconfigured clients.

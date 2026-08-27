@@ -196,7 +196,7 @@ func TestConfigNormalize(t *testing.T) {
 	if c.ServerPort != 8080 {
 		t.Errorf("expected default port, got %d", c.ServerPort)
 	}
-	if c.LogRetention != 7 {
+	if c.LogRetention != 30 {
 		t.Errorf("expected default retention, got %d", c.LogRetention)
 	}
 	if c.Providers == nil || c.ModelAliases == nil {

@@ -13,6 +13,8 @@ import {
 } from 'antd'
 import {
   LuBox,
+  LuCalendarDays,
+  LuCalendarRange,
   LuCirclePlus,
   LuCopy,
   LuKeyRound,
@@ -21,6 +23,8 @@ import {
   LuServer,
   LuSparkles,
   LuSquare,
+  LuTrendingDown,
+  LuTrendingUp,
   LuTriangleAlert,
   LuZap,
 } from 'react-icons/lu'
@@ -34,6 +38,13 @@ import { EmptyState } from '@/components/ui/EmptyState'
 const ModelTrendChart = lazy(() =>
   import('@/components/charts/ModelTrendChart').then((m) => ({
     default: m.ModelTrendChart,
+  })),
+)
+// The 24h stacked traffic chart shares the @ant-design/charts bundle, so
+// it is lazy-loaded alongside the trend chart to keep first paint light.
+const RecentTrafficChart = lazy(() =>
+  import('@/components/charts/RecentTrafficChart').then((m) => ({
+    default: m.RecentTrafficChart,
   })),
 )
 import { useConfigStore } from '@/store/config'
@@ -68,9 +79,34 @@ export function Dashboard() {
     return unsubscribe
   }, [])
 
-  const previousRequests = statsWC?.prevRequests ?? 0
-  const previousInput = statsWC?.prevInputTokens ?? 0
-  const previousOutput = statsWC?.prevOutputTokens ?? 0
+  // Rolling-window consumption: all-time / last 7 days / last 30 days,
+  // each with the previous equivalent window for period-over-period
+  // deltas. Consumption is measured in total tokens (input + output).
+  const allTime = statsWC?.allTime
+  const week = statsWC?.week
+  const prevWeek = statsWC?.prevWeek
+  const month = statsWC?.month
+  const prevMonth = statsWC?.prevMonth
+
+  const allTimeTokens = (allTime?.inputTokens ?? 0) + (allTime?.outputTokens ?? 0)
+  const weekTokens = (week?.inputTokens ?? 0) + (week?.outputTokens ?? 0)
+  const prevWeekTokens = (prevWeek?.inputTokens ?? 0) + (prevWeek?.outputTokens ?? 0)
+  const monthTokens = (month?.inputTokens ?? 0) + (month?.outputTokens ?? 0)
+  const prevMonthTokens = (prevMonth?.inputTokens ?? 0) + (prevMonth?.outputTokens ?? 0)
+
+  // Percent change vs the previous equivalent window. Null when there
+  // is no baseline so the UI renders a dash instead of a misleading
+  // "-100%".
+  const pctChange = (cur: number, prev: number): number | null =>
+    prev > 0 ? ((cur - prev) / prev) * 100 : null
+  const weekDelta = pctChange(weekTokens, prevWeekTokens)
+  const monthDelta = pctChange(monthTokens, prevMonthTokens)
+
+  // 7-day error rate vs the previous 7 days.
+  const weekErrorRate =
+    (week?.requests ?? 0) > 0 ? ((week?.errors ?? 0) / (week?.requests ?? 0)) * 100 : 0
+  const prevWeekErrorRate =
+    (prevWeek?.requests ?? 0) > 0 ? ((prevWeek?.errors ?? 0) / (prevWeek?.requests ?? 0)) * 100 : 0
 
   const enabledAliases = useMemo(
     () => modelAliases.filter((a) => a.enabled),
@@ -80,17 +116,6 @@ export function Dashboard() {
   const providerById = useMemo(() => {
     return new Map(providers.map((p) => [p.id, p]))
   }, [providers])
-
-  const traffic = stats?.requestsByHour ?? []
-
-  const totalRequests = stats?.totalRequests ?? 0
-  const totalErrors = useMemo(
-    () => traffic.reduce((sum, b) => sum + b.errors, 0),
-    [traffic],
-  )
-  const errorRate = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0
-
-  const sparklineData = useMemo(() => traffic.map((b) => b.count), [traffic])
 
   // Use the i18n catalog when the key exists, otherwise fall back to the
   // hard-coded English message so we don't depend on locale changes for
@@ -167,54 +192,46 @@ export function Dashboard() {
           <>
             <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
               <Statistic
-                title={t('dashboard.totalRequests')}
-                value={formatNumber(totalRequests)}
+                title={t('dashboard.allTimeConsumption')}
+                value={formatNumber(allTimeTokens)}
                 prefix={<LuZap className="size-4 text-accent" aria-hidden />}
               />
-              {previousRequests !== 0 && (
-                <Typography.Text type="secondary" className="mt-2! block text-xs">
-                  {(((totalRequests - previousRequests) / Math.max(previousRequests, 1)) * 100).toFixed(1)}%
-                </Typography.Text>
-              )}
-              {sparklineData.length > 0 && (
-                <div className="mt-3 text-xs text-fg-muted">
-                  peak: {formatNumber(Math.max(...sparklineData))}
-                </div>
-              )}
-            </Card>
-            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
-              <Statistic
-                title={t('dashboard.inputTokens')}
-                value={formatNumber(stats?.totalInputTokens ?? 0)}
-                prefix={<LuCopy className="size-4 text-accent" aria-hidden />}
+              <TokenBreakdown
+                input={allTime?.inputTokens ?? 0}
+                output={allTime?.outputTokens ?? 0}
+                t={t}
               />
-              {previousInput !== 0 && (
-                <Typography.Text type="secondary" className="mt-2! block text-xs">
-                  {(((stats?.totalInputTokens ?? 0) - previousInput) / Math.max(previousInput, 1) * 100).toFixed(1)}%
-                </Typography.Text>
-              )}
             </Card>
             <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
               <Statistic
-                title={t('dashboard.outputTokens')}
-                value={formatNumber(stats?.totalOutputTokens ?? 0)}
-                prefix={<LuCopy className="size-4 text-success" aria-hidden />}
+                title={t('dashboard.weekConsumption')}
+                value={formatNumber(weekTokens)}
+                prefix={<LuCalendarDays className="size-4 text-accent" aria-hidden />}
               />
-              {previousOutput !== 0 && (
-                <Typography.Text type="secondary" className="mt-2! block text-xs">
-                  {(((stats?.totalOutputTokens ?? 0) - previousOutput) / Math.max(previousOutput, 1) * 100).toFixed(1)}%
-                </Typography.Text>
-              )}
+              <DeltaLine prev={prevWeekTokens} prevLabel={t('dashboard.prevWeek')} percent={weekDelta} />
+              <TokenBreakdown input={week?.inputTokens ?? 0} output={week?.outputTokens ?? 0} t={t} />
             </Card>
             <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
               <Statistic
-                title={t('dashboard.errorRate')}
-                value={errorRate === 0 ? '0%' : `${errorRate.toFixed(1)}%`}
+                title={t('dashboard.monthConsumption')}
+                value={formatNumber(monthTokens)}
+                prefix={<LuCalendarRange className="size-4 text-success" aria-hidden />}
+              />
+              <DeltaLine prev={prevMonthTokens} prevLabel={t('dashboard.prevMonth')} percent={monthDelta} />
+              <TokenBreakdown input={month?.inputTokens ?? 0} output={month?.outputTokens ?? 0} t={t} />
+            </Card>
+            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
+              <Statistic
+                title={t('dashboard.weekErrorRate')}
+                value={weekErrorRate === 0 ? '0%' : `${weekErrorRate.toFixed(1)}%`}
                 prefix={<LuTriangleAlert
-                  className={`size-4 ${errorRate > 5 ? 'text-danger' : errorRate > 1 ? 'text-warning' : 'text-fg-subtle'}`}
+                  className={`size-4 ${weekErrorRate > 5 ? 'text-danger' : weekErrorRate > 1 ? 'text-warning' : 'text-fg-subtle'}`}
                   aria-hidden
                 />}
               />
+              <Typography.Text type="secondary" className="mt-2! block text-xs">
+                {t('dashboard.prevWeek')}: {prevWeekErrorRate.toFixed(1)}%
+              </Typography.Text>
             </Card>
           </>
         )}
@@ -399,10 +416,20 @@ export function Dashboard() {
         <ModelTrendChartContainer />
       </div>
 
+      {/* Recent traffic — 24h stacked success/error column chart. The
+       * component existed with full i18n coverage but was never mounted,
+       * leaving the homepage without a traffic overview. Placed full-width
+       * under the trend chart so the two chart surfaces read as one band. */}
+      <div>
+        <Suspense fallback={<Skeleton active />}>
+          <RecentTrafficChart traffic={stats?.requestsByHour ?? []} />
+        </Suspense>
+      </div>
+
       {/* Traffic by client key — sorted by total traffic so the busiest
        * client surfaces first, with a per-row key chip, recent-24h
        * substat, and a right-aligned big total. */}
-      <div className='mt-4'>
+      <div>
         <Card
           title={
             <div className="flex items-center gap-2.5">
@@ -505,10 +532,10 @@ export function Dashboard() {
       </div>
 
       {/* Models in use — each enabled alias becomes a small "routing
-       * card" with the public name, a Provider → model flow line,
-       * and a status tag. Wider gap between rows mirrors the byClientKey
-       * card for visual consistency. */}
-      <div className='mt-4'>
+        * card" with the public name, a Provider → model flow line,
+        * and a status tag. Wider gap between rows mirrors the byClientKey
+        * card for visual consistency. */}
+       <div>
         <Card
           title={
             <div className="flex items-center gap-2.5">
@@ -596,8 +623,10 @@ function ModelTrendChartContainer() {
   const t = useT()
 
   const [mode, setMode] = useState<'all' | 'single'>('all')
-  const [windowHours, setWindowHours] = useState<24 | 168>(24)
+  const [windowHours, setWindowHours] = useState<24 | 168 | 720>(24)
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined)
+  // Default to 'tokens' per the optimize-model-trend-tokens spec.
+  const [metric, setMetric] = useState<'requests' | 'tokens'>('tokens')
 
   const enabledAliases = useMemo(
     () => modelAliases.filter((a) => a.enabled),
@@ -607,23 +636,43 @@ function ModelTrendChartContainer() {
   // Fallback to `any` cast: the regenerated Wails `Stats` type has
   // not yet picked up `requestsByHourByModel`, but the backend
   // already returns `Record<alias, HourBucket[]>` over the wire.
-  const data = useMemo(
+  //
+  // Re-derived from `stats` whenever the store emits a new
+  // (reference-different) stats object — including the 2s heartbeat.
+  // Because `statsShallowEqual` swaps the reference on `totalRequests`
+  // changes, `byModel` carries the latest hourly buckets and is the
+  // single source of truth for `data`.
+  const byModel = useMemo(
     () =>
-      ((stats as unknown as {requestsByHourByModel?: Record<string, HourBucket[]>})
-        ?.requestsByHourByModel ?? {}) as Record<string, HourBucket[]>,
+      (stats as unknown as {requestsByHourByModel?: Record<string, HourBucket[]>})
+        ?.requestsByHourByModel,
     [stats],
+  )
+  // `data` follows the latest `byModel` directly. It MUST NOT be pinned
+  // to the alias roster: same aliases with updated hourly buckets (new
+  // requests / hour rollover) keep the key set stable, so pinning on the
+  // roster froze the chart at its first frame. Depending on `byModel`
+  // keeps the trend live while still avoiding needless re-renders when
+  // the heartbeat doesn't change the stats reference.
+  const data = useMemo(
+    () => (byModel ?? ({} as Record<string, HourBucket[]>)),
+    [byModel],
   )
 
   const handleModeChange = useCallback((value: 'all' | 'single') => {
     setMode(value)
   }, [])
 
-  const handleWindowChange = useCallback((value: 24 | 168) => {
+  const handleWindowChange = useCallback((value: 24 | 168 | 720) => {
     setWindowHours(value)
   }, [])
 
   const handleModelChange = useCallback((value: string) => {
     setSelectedModel(value)
+  }, [])
+
+  const handleMetricChange = useCallback((value: 'requests' | 'tokens') => {
+    setMetric(value)
   }, [])
 
   // In single mode the Select drives the chart; if the user hasn't
@@ -632,49 +681,121 @@ function ModelTrendChartContainer() {
   const effectiveSelected =
     mode === 'single' ? selectedModel ?? enabledAliases[0]?.alias : undefined
 
+  // The Segmented row drives the chart's `mode` / `windowHours` /
+  // `metric`. Render it once and pass via `extra` so the
+  // ModelTrendChart's wrapping Card header stays consistent with
+  // RecentTrafficChart (same Card, same header placement).
+  const controls = (
+    <Space size="small" wrap>
+      <Segmented
+        value={metric}
+        onChange={(v) => handleMetricChange(v as 'requests' | 'tokens')}
+        options={[
+          {label: t('dashboard.modelTrend.metric.requests'), value: 'requests'},
+          {label: t('dashboard.modelTrend.metric.tokens'), value: 'tokens'},
+        ]}
+      />
+      <Segmented
+        value={windowHours}
+        onChange={(v) => handleWindowChange(v as 24 | 168 | 720)}
+        options={[
+          {label: t('dashboard.modelTrend.window.24h'), value: 24},
+          {label: t('dashboard.modelTrend.window.7d'), value: 168},
+          {label: t('dashboard.modelTrend.window.30d'), value: 720},
+        ]}
+      />
+      <Segmented
+        value={mode}
+        onChange={(v) => handleModeChange(v as 'all' | 'single')}
+        options={[
+          {label: t('dashboard.modelTrend.mode.all'), value: 'all'},
+          {label: t('dashboard.modelTrend.mode.single'), value: 'single'},
+        ]}
+      />
+      {mode === 'single' && enabledAliases.length > 0 && (
+        <Select
+          value={effectiveSelected}
+          onChange={handleModelChange}
+          placeholder={t('dashboard.modelTrend.selectModel')}
+          options={enabledAliases.map((a) => ({
+            label: a.alias,
+            value: a.alias,
+          }))}
+          style={{minWidth: 180}}
+        />
+      )}
+    </Space>
+  )
+
   return (
-    <Card variant="outlined" className="lg:col-span-2">
-      <Space size="middle" wrap className="mb-3">
-        <Segmented
-          value={windowHours}
-          onChange={(v) => handleWindowChange(v as 24 | 168)}
-          options={[
-            {label: t('dashboard.modelTrend.window.24h'), value: 24},
-            {label: t('dashboard.modelTrend.window.7d'), value: 168},
-          ]}
-        />
-        <Segmented
-          value={mode}
-          onChange={(v) => handleModeChange(v as 'all' | 'single')}
-          options={[
-            {label: t('dashboard.modelTrend.mode.all'), value: 'all'},
-            {label: t('dashboard.modelTrend.mode.single'), value: 'single'},
-          ]}
-        />
-        {mode === 'single' && enabledAliases.length > 0 && (
-          <Select
-            value={effectiveSelected}
-            onChange={handleModelChange}
-            placeholder={t('dashboard.modelTrend.selectModel')}
-            options={enabledAliases.map((a) => ({
-              label: a.alias,
-              value: a.alias,
-            }))}
-            style={{minWidth: 180}}
-          />
-        )}
-      </Space>
-      <Suspense fallback={<Skeleton active />}>
-        <ModelTrendChart
-          data={data}
-          mode={mode}
-          selectedModel={effectiveSelected}
-          windowHours={windowHours}
-          title={t('dashboard.modelTrend.title')}
-          description={t('dashboard.modelTrend.desc')}
-          className="lg:col-span-2"
-        />
-      </Suspense>
-    </Card>
+    <Suspense fallback={<Skeleton active />}>
+      <ModelTrendChart
+        data={data}
+        metric={metric}
+        mode={mode}
+        selectedModel={effectiveSelected}
+        windowHours={windowHours}
+        title={t('dashboard.modelTrend.title')}
+        description={t('dashboard.modelTrend.desc')}
+        extra={controls}
+        className="lg:col-span-2"
+      />
+    </Suspense>
+  )
+}
+
+/**
+ * DeltaLine renders the "vs previous period" comparison under a KPI
+ * value: an up/down arrow with the percent change (green up / red down)
+ * plus the previous period's absolute value. When there is no baseline
+ * the percent is omitted and only the previous value is shown.
+ */
+function DeltaLine({
+  prev,
+  prevLabel,
+  percent,
+}: {
+  prev: number
+  prevLabel: string
+  percent: number | null
+}) {
+  return (
+    <Typography.Text type="secondary" className="mt-2! block text-xs">
+      {percent !== null ? (
+        <span className={percent >= 0 ? 'text-success' : 'text-danger'}>
+          {percent >= 0 ? (
+            <LuTrendingUp className="mr-0.5 inline size-3.5" aria-hidden />
+          ) : (
+            <LuTrendingDown className="mr-0.5 inline size-3.5" aria-hidden />
+          )}
+          {Math.abs(percent).toFixed(1)}%
+        </span>
+      ) : (
+        <span className="text-fg-muted">—</span>
+      )}
+      <span className="mx-1">·</span>
+      {prevLabel}: {formatNumber(prev)}
+    </Typography.Text>
+  )
+}
+
+/**
+ * TokenBreakdown renders the input / output token split under a
+ * consumption KPI value.
+ */
+function TokenBreakdown({
+  input,
+  output,
+  t,
+}: {
+  input: number
+  output: number
+  t: (key: string) => string
+}) {
+  return (
+    <Typography.Text type="secondary" className="mt-1! block text-xs">
+      {t('dashboard.inputShort')} {formatNumber(input)} · {t('dashboard.outputShort')}{' '}
+      {formatNumber(output)}
+    </Typography.Text>
   )
 }

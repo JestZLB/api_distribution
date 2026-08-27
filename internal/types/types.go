@@ -181,21 +181,77 @@ type Stats struct {
 	RequestsByHourByModel     map[string][]HourBucket `json:"requestsByHourByModel"`
 }
 
-// StatsWithComparison extends Stats with previous-period data for delta display.
+// PeriodStats aggregates usage over a rolling window of calendar days.
+// AvgLatency is the mean latency over the window's requests.
+type PeriodStats struct {
+	Requests     int64 `json:"requests"`
+	InputTokens  int64 `json:"inputTokens"`
+	OutputTokens int64 `json:"outputTokens"`
+	Errors       int64 `json:"errors"`
+	AvgLatency   int64 `json:"avgLatency"`
+}
+
+// StatsWithComparison extends Stats with day-over-day comparison data
+// for delta display. Today* are the current calendar day's aggregates,
+// Yesterday* the previous full calendar day's, so the dashboard can
+// show "today vs yesterday" with an up/down percentage.
 type StatsWithComparison struct {
 	Stats
+	// Prev* are kept for backward compatibility with the frontend's
+	// `isComparison` type probe and now mirror Yesterday* (previously
+	// they summed every full day before today).
 	PrevRequests     int64 `json:"prevRequests"`
 	PrevInputTokens  int64 `json:"prevInputTokens"`
 	PrevOutputTokens int64 `json:"prevOutputTokens"`
 	PrevAvgLatency   int64 `json:"prevAvgLatency"`
+
+	// Today's aggregates (current calendar day so far).
+	TodayRequests     int64 `json:"todayRequests"`
+	TodayInputTokens  int64 `json:"todayInputTokens"`
+	TodayOutputTokens int64 `json:"todayOutputTokens"`
+	TodayErrors       int64 `json:"todayErrors"`
+	TodayAvgLatency   int64 `json:"todayAvgLatency"`
+
+	// Yesterday's aggregates (previous full calendar day).
+	YesterdayRequests     int64 `json:"yesterdayRequests"`
+	YesterdayInputTokens  int64 `json:"yesterdayInputTokens"`
+	YesterdayOutputTokens int64 `json:"yesterdayOutputTokens"`
+	YesterdayErrors       int64 `json:"yesterdayErrors"`
+	YesterdayAvgLatency   int64 `json:"yesterdayAvgLatency"`
+
+	// Rolling-window consumption for the dashboard's top cards:
+	// all-time, last 7 days, last 30 days, plus the previous equivalent
+	// windows so the UI can show period-over-period deltas.
+	AllTime   PeriodStats `json:"allTime"`
+	Week      PeriodStats `json:"week"`
+	PrevWeek  PeriodStats `json:"prevWeek"`
+	Month     PeriodStats `json:"month"`
+	PrevMonth PeriodStats `json:"prevMonth"`
 }
 
-// HourBucket is one hour of request counts.
+// HourBucket is one hour of request counts and token usage. Token
+// fields are partitioned by model alias so the dashboard can plot a
+// per-alias hourly curve in either request-count or token-volume.
 type HourBucket struct {
 	Hour    int64            `json:"hour"` // unix seconds, aligned to hour
 	Count   int64            `json:"count"`
 	Errors  int64            `json:"errors"`
 	ByModel map[string]int64 `json:"byModel"`
+	// InputTokens / OutputTokens are the hour's totals across every
+	// alias. They mirror Stats.TotalInputTokens / TotalOutputTokens but
+	// scoped to a single hour and are summed across days in sumDays.
+	InputTokens  int64 `json:"inputTokens"`
+	OutputTokens int64 `json:"outputTokens"`
+	// ByModelTokens is the per-alias *total* token count
+	// (InputTokens+OutputTokens) for this hour. ByModelInputTokens /
+	// ByModelOutputTokens split that total back into the input and
+	// output sides per alias so the frontend can render both a combined
+	// token trend and the input/output breakdown for any alias without
+	// re-aggregating. All three are nil-safe: a legacy daily JSON that
+	// predates these fields unmarshals to a zero / empty map.
+	ByModelTokens       map[string]int64 `json:"byModelTokens"`
+	ByModelInputTokens  map[string]int64 `json:"byModelInputTokens"`
+	ByModelOutputTokens map[string]int64 `json:"byModelOutputTokens"`
 }
 
 // Config is the persisted application configuration.
@@ -343,7 +399,7 @@ func DefaultConfig() Config {
 		ServerHost:         "127.0.0.1",
 		ServerPort:         8080,
 		ClientKeys:         []ClientKey{},
-		LogRetention:       7,
+		LogRetention:       30,
 		Providers:          []Provider{},
 		ModelAliases:       []ModelAlias{},
 		ShutdownTimeoutSec: 5,

@@ -38,8 +38,46 @@ func newDaily(date string) *DailyAgg {
 	}
 }
 
+// normalize fills nil maps with empty ones so sumDays() and the SQL
+// loaders can safely read/map-range them. It is idempotent.
+func (d *DailyAgg) normalize() {
+	if d.ByModel == nil {
+		d.ByModel = map[string]int64{}
+	}
+	if d.ByProvider == nil {
+		d.ByProvider = map[string]int64{}
+	}
+	if d.ByClientKey == nil {
+		d.ByClientKey = map[string]int64{}
+	}
+	if d.ByHour == nil {
+		d.ByHour = map[int64]types.HourBucket{}
+	}
+	for h, b := range d.ByHour {
+		if b.ByModel == nil {
+			b.ByModel = map[string]int64{}
+		}
+		if b.ByModelTokens == nil {
+			b.ByModelTokens = map[string]int64{}
+		}
+		if b.ByModelInputTokens == nil {
+			b.ByModelInputTokens = map[string]int64{}
+		}
+		if b.ByModelOutputTokens == nil {
+			b.ByModelOutputTokens = map[string]int64{}
+		}
+		d.ByHour[h] = b
+	}
+}
+
 // dateKey returns the DayLayout string for a unix-nano timestamp.
 func dateKey(ts int64) string { return time.Unix(0, ts).Format(DayLayout) }
+
+// truncateHour returns the unix-seconds timestamp of the start of the
+// hour containing the given unix-nano ts. Both time.Unix() and the
+// truncation live here so call sites stay a one-liner and the hot
+// path of add() never has to repeat the conversion.
+func truncateHour(ts int64) int64 { return time.Unix(0, ts).Truncate(time.Hour).Unix() }
 
 // add folds one proxied request into the day's aggregates.
 func (d *DailyAgg) add(e types.LogEntry) {
@@ -79,17 +117,33 @@ func (d *DailyAgg) add(e types.LogEntry) {
 	if e.ClientKeyLabel != "" {
 		d.ByClientKey[e.ClientKeyLabel]++
 	}
-	h := time.Unix(0, e.Timestamp).Truncate(time.Hour).Unix()
+	h := truncateHour(e.Timestamp)
 	a := d.ByHour[h]
 	a.Count++
 	if isErr {
 		a.Errors++
 	}
+	in := int64(e.InputTokens)
+	out := int64(e.OutputTokens)
+	a.InputTokens += in
+	a.OutputTokens += out
 	if e.Alias != "" {
 		if a.ByModel == nil {
 			a.ByModel = map[string]int64{}
 		}
 		a.ByModel[e.Alias]++
+		if a.ByModelTokens == nil {
+			a.ByModelTokens = map[string]int64{}
+		}
+		a.ByModelTokens[e.Alias] += in + out
+		if a.ByModelInputTokens == nil {
+			a.ByModelInputTokens = map[string]int64{}
+		}
+		a.ByModelInputTokens[e.Alias] += in
+		if a.ByModelOutputTokens == nil {
+			a.ByModelOutputTokens = map[string]int64{}
+		}
+		a.ByModelOutputTokens[e.Alias] += out
 	}
 	d.ByHour[h] = a
 }

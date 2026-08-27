@@ -40,7 +40,6 @@ var (
 	procLoadCursor          = user32.NewProc("LoadCursorW")
 	procLoadIconW           = user32.NewProc("LoadIconW")
 	procGetMessageW         = user32.NewProc("GetMessageW")
-	procPeekMessageW        = user32.NewProc("PeekMessageW")
 	procTranslateMessage    = user32.NewProc("TranslateMessage")
 	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")

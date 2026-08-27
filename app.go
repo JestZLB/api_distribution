@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"api_distribution/internal/config"
@@ -35,8 +35,27 @@ type App struct {
 	proxy   *server.Server
 	version string
 
-	mu      sync.Mutex
-	started bool
+	// statsCache is a 100ms process-internal TTL cache shared by
+	// GetStats and GetStatsWithComparison. The store's onChange hook
+	// invalidates it on every Append / Clear / PurgeOlderThan so the
+	// next heartbeat sees fresh data.
+	statsCache statsCache
+
+	// flushArmed is set while one 3-second auto-flush goroutine is
+	// in flight. It coalesces the many Appends that arrive in a burst
+	// into a single disk write a few seconds after the first one, so
+	// an abnormally-terminated process (task manager kill, wails dev
+	// Ctrl+C, crash) loses at most the trailing ~3s instead of the
+	// entire run (the periodic 5s tick is the lower-bound safety net).
+	flushArmed atomic.Bool
+
+	// flushMu serializes flushPersisted so the 5s ticker, the 3s
+	// auto-flush goroutine and shutdown() never interleave two
+	// SaveLogs on the same dirty-range markers (concurrent
+	// incremental flushes could otherwise double-advance dirtyStart).
+	flushMu sync.Mutex
+
+	mu sync.Mutex
 	// forceQuit is set by the explicit Quit paths (tray menu, Settings
 	// "Quit app"). When enabled, OnBeforeClose in main.go lets the
 	// window close instead of hiding to tray, so a deliberate quit
@@ -68,7 +87,11 @@ func NewApp(dir string) *App {
 	if _, err := cfgMgr.Load(); err != nil {
 		fmt.Println("warning: load config:", err)
 	}
-	st := store.New()
+	st, err := store.Open(store.DBPath(dir))
+	if err != nil {
+		fmt.Println("warning: open sqlite, falling back to in-memory:", err)
+		st = store.New()
+	}
 	srv := server.New(cfgMgr, st)
 
 	return &App{
@@ -86,12 +109,26 @@ func NewApp(dir string) *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	// Load persisted logs and per-date stats from disk.
-	logFile := store.LogPath(a.cfgDir)
-	if err := a.store.LoadFromJSON(logFile); err != nil {
+	// One-time migration from the legacy JSON persistence layout
+	// (logs.json + stats/*.json) into the SQLite database. It is
+	// idempotent and a no-op after the first run.
+	if err := a.store.MigrateLegacyJSON(a.cfgDir); err != nil {
+		fmt.Println("warning: migrate legacy json:", err)
+	}
+
+	// Wire the store's mutation hook so every Append / Clear /
+	// PurgeOlderThan / LoadLogs invalidates the 100ms stats cache.
+	// Without this hook a brand-new request would be hidden behind a
+	// stale value for up to 100ms, which is fine for the dashboard
+	// but surprising on the Logs page where the user just submitted
+	// a request and expects to see it.
+	a.store.SetOnChange(a.statsCache.invalidate)
+
+	// Load persisted logs and per-date stats from SQLite.
+	if err := a.store.LoadLogs(); err != nil {
 		fmt.Println("warning: load logs:", err)
 	}
-	if err := a.store.LoadAllDaily(store.StatsDir(a.cfgDir)); err != nil {
+	if err := a.store.LoadAllDaily(); err != nil {
 		fmt.Println("warning: load stats:", err)
 	}
 
@@ -164,13 +201,19 @@ func (a *App) shutdown(_ context.Context) {
 	}
 
 	// Persist logs to disk on shutdown so we don't lose data.
-	if err := a.store.SaveToJSON(store.LogPath(a.cfgDir)); err != nil {
+	if err := a.store.SaveLogs(); err != nil {
 		fmt.Println("warning: save logs:", err)
 	}
 	// Persist per-date stats on shutdown too.
-	if err := a.store.SaveDaily(store.StatsDir(a.cfgDir), a.cfgMgr.Get().LogRetention); err != nil {
+	if err := a.store.SaveDaily(a.cfgMgr.Get().LogRetention); err != nil {
 		fmt.Println("warning: save stats:", err)
 	}
+	// Release the SQLite handle AFTER the final flush. Leaving it open
+	// holds a file lock on Windows, so a second app instance started
+	// while the first is still exiting can hit "database is locked"
+	// and silently fail to write — which manifests as "data wiped on
+	// restart".
+	a.store.Close()
 }
 
 // ---------------------------------------------------------------------
@@ -617,24 +660,40 @@ func (a *App) GetLogs(n int) []types.LogEntry {
 // launch starts from a clean state.
 func (a *App) ClearLogs() error {
 	a.store.Clear()
+	a.store.ClearPersisted()
 	a.emitLogsChanged()
-	logFile := store.LogPath(a.cfgDir)
-	if err := os.Remove(logFile); err != nil && !os.IsNotExist(err) {
-		fmt.Println("warning: remove log file:", err)
-	}
-	store.ClearDailyFiles(store.StatsDir(a.cfgDir))
 	return nil
 }
 
 // GetStats returns aggregated stats.
+//
+// The 100ms in-process TTL cache (see statsCache) lets concurrent
+// heartbeats from the frontend share one computation. The cache is
+// invalidated on every Append / Clear / PurgeOlderThan via the store's
+// onChange hook, so a brand-new request never lingers past 100ms.
 func (a *App) GetStats() types.Stats {
-	return a.store.Stats()
+	if cached, ok := a.statsCache.getStats(); ok {
+		return *cached
+	}
+	fresh := a.store.Stats()
+	a.statsCache.putStats(&fresh)
+	return fresh
 }
 
 // GetStatsWithComparison returns aggregated stats together with
 // previous-period comparison data for delta display in the UI.
+//
+// Shares the same 100ms TTL cache as GetStats: if either call has
+// populated the cache within the last 100ms the other returns the
+// cached pointer. The comparison variant is the one the dashboard
+// actually fetches, so this is the hot-path win.
 func (a *App) GetStatsWithComparison() types.StatsWithComparison {
-	return a.store.StatsWithComparison()
+	if cached, ok := a.statsCache.getStatsWithComparison(); ok {
+		return *cached
+	}
+	fresh := a.store.StatsWithComparison()
+	a.statsCache.putStatsWithComparison(&fresh)
+	return fresh
 }
 
 // ---------------------------------------------------------------------
@@ -875,39 +934,83 @@ func (a *App) emitLogsLoop() {
 // purges entries older than the configured LogRetention days.
 //
 // It is a "dirty write" loop: when nothing has changed since the last
-// flush it returns immediately without touching the disk. This keeps
-// idle gateways at zero I/O on each 30-second heartbeat instead of
-// re-marshalling the full ring buffer for nothing.
+// flush it returns immediately without touching the disk. The 5-second
+// cadence (down from 30s) bounds how much a forcibly-terminated
+// process can lose: with the Append-driven scheduleFlush() running in
+// parallel, the worst case window is a few seconds of trailing data.
 func (a *App) persistLogsLoop() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[loop] panic in persistLogsLoop: %v\n%s", r, debug.Stack())
 		}
 	}()
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-a.ctx.Done():
+			// Final flush so a non-graceful context cancellation still
+			// persists whatever accumulated since the last tick.
+			a.flushPersisted()
 			return
 		case <-ticker.C:
 			cfg := a.cfgMgr.Get()
 			if cfg.LogRetention > 0 {
 				a.store.PurgeOlderThan(time.Duration(cfg.LogRetention) * 24 * time.Hour)
 			}
-			if !a.store.IsDirty() {
-				continue
-			}
-			if err := a.store.SaveToJSON(store.LogPath(a.cfgDir)); err != nil {
-				log.Printf("error saving logs: %v", err)
-				continue
-			}
-			if err := a.store.SaveDaily(store.StatsDir(a.cfgDir), cfg.LogRetention); err != nil {
-				log.Printf("error saving stats: %v", err)
-				continue
-			}
-			a.store.MarkClean()
+			a.flushPersisted()
 		}
+	}
+}
+
+// scheduleFlush coalesces the burst of Appends that typically arrive
+// in a short window into ONE disk flush a few seconds after the first
+// one. It is safe to call from the store's onChange hook (which fires
+// with no store lock held) and from multiple goroutines: only the
+// first call arms the timer, subsequent calls within the 3s window are
+// ignored (flushArmed CAS).
+func (a *App) scheduleFlush() {
+	if !a.flushArmed.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.flushArmed.Store(false)
+		select {
+		case <-time.After(3 * time.Second):
+			a.flushPersisted()
+		case <-a.ctx.Done():
+			// Process exiting — let shutdown()'s explicit flush own
+			// the final save to avoid racing it.
+		}
+	}()
+}
+
+// flushPersisted writes the log buffer and per-date stats to disk when
+// there is anything dirty. The two saves are independent: a failure to
+// write logs.json must not prevent the daily stats (which carry the
+// request + token aggregates) from being persisted, and vice versa.
+// The dirty flag is only cleared when both succeed so a failed save is
+// retried on the next tick.
+func (a *App) flushPersisted() {
+	// Serialize against the other flush sources (5s ticker, 3s
+	// auto-flush goroutine, shutdown). Concurrent SaveLogs calls would
+	// race on the dirty-range markers and could skip or duplicate rows.
+	a.flushMu.Lock()
+	defer a.flushMu.Unlock()
+
+	if !a.store.IsDirty() {
+		return
+	}
+	logsErr := a.store.SaveLogs()
+	statsErr := a.store.SaveDaily(a.cfgMgr.Get().LogRetention)
+	if logsErr != nil {
+		log.Printf("error saving logs: %v", logsErr)
+	}
+	if statsErr != nil {
+		log.Printf("error saving stats: %v", statsErr)
+	}
+	if logsErr == nil && statsErr == nil {
+		a.store.MarkClean()
 	}
 }
 
