@@ -193,6 +193,10 @@ func (s *Store) Clear() {
 	// Persist-side wipe happens outside the lock so a slow disk does
 	// not block concurrent Append. ClearPersisted is idempotent.
 	_, _ = s.db.Exec(`DELETE FROM logs`)
+	// Also wipe the persisted daily aggregates: otherwise a restart
+	// would LoadAllDaily() and resurrect the totals the user just
+	// cleared, leaving logs and stats out of sync.
+	s.ClearDaily()
 
 	s.fireOnChange()
 }

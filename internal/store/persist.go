@@ -187,6 +187,14 @@ func (s *Store) PurgeOlderThan(d time.Duration) int {
 	// Best-effort: drop the same rows from the logs table. The ring
 	// buffer stays authoritative for what the UI surfaces this session.
 	_, _ = s.db.Exec(`DELETE FROM logs WHERE ts < ?`, cutoff)
+	if purged > 0 {
+		// Both the in-memory ring buffer and the persisted logs table
+		// lost entries; notify subscribers so cached stats (totals,
+		// hourly buckets that overlap the purge window, etc.) get
+		// invalidated. fireOnChange must run without s.mu held — the
+		// unlock above already guarantees that.
+		s.fireOnChange()
+	}
 	return purged
 }
 
@@ -218,12 +226,20 @@ func (s *Store) SaveDaily(retentionDays int) error {
 			return fmt.Errorf("prune daily_stats: %w", err)
 		}
 		s.mu.Lock()
+		pruned := false
 		for _, d := range kept {
 			if d.Date < cutoff {
 				delete(s.days, d.Date)
+				pruned = true
 			}
 		}
 		s.mu.Unlock()
+		if pruned {
+			// Pruning dropped at least one in-memory day aggregate;
+			// surface the change so cached stats derived from
+			// `days` (e.g. the dashboard totals) get invalidated.
+			s.fireOnChange()
+		}
 	}
 	return nil
 }
