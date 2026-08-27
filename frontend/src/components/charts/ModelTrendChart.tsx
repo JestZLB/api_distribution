@@ -1,4 +1,4 @@
-import {useMemo, type JSX} from 'react'
+import {useEffect, useMemo, useRef, type JSX} from 'react'
 import {Line} from '@ant-design/charts'
 import {ChartCard} from '@/components/charts/ChartCard'
 import {ChartEmpty} from '@/components/charts/ChartEmpty'
@@ -225,59 +225,136 @@ export function ModelTrendChart({
     [models],
   )
 
-  // Tooltip — G2 v5's `tooltip.title` is a *channel field reference*, not
-  // a render function: passing a function makes G2 display the function
-  // itself / an inconsistent value instead of the hovered hour. The only
-  // reliable way to format the title (and render items with localised
-  // metric labels) is `customContent`, which we use below.
+  // Hour → model → value lookup for the tooltip. We can't use the
+  // `items` array G2 passes to customContent directly: when a series
+  // has zero traffic at the hovered hour, G2 drops it from `items`
+  // and the user only sees a partial list. We instead iterate every
+  // alias ourselves so the tooltip always shows one row per model
+  // (with 0 for the empty ones).
   //
-  // `items` here are deprecated in favour of `customContent`; G2 passes
-  // every hovered series' {name, value, color, ...} to the callback.
+  // Held in a ref instead of the tooltipConfig's closure so that the
+  // 2s stats heartbeat doesn't rebuild the tooltip config (and the
+  // whole chart) on every tick — only `models` changes the tooltip's
+  // structure, the values come from the ref.
+  const rowsByHour = useMemo(() => {
+    const m = new Map<number, Map<string, number>>()
+    for (const row of rows) {
+      let perModel = m.get(row.hour)
+      if (!perModel) {
+        perModel = new Map()
+        m.set(row.hour, perModel)
+      }
+      perModel.set(row.model, metric === 'tokens' ? row.tokens : row.count)
+    }
+    return m
+  }, [rows, metric])
+  const rowsByHourRef = useRef(rowsByHour)
+  useEffect(() => {
+    rowsByHourRef.current = rowsByHour
+  }, [rowsByHour])
+
+  // The render callback is held in a ref so the 2s stats heartbeat
+  // doesn't rebuild the interaction config (and the whole chart) on
+  // every tick. The closure reads fresh values from `models`,
+  // `colorRange`, `windowHours`, and `rowsByHourRef`.
+  const tooltipRenderRef = useRef<
+    ((event: unknown, options: {items: unknown[]; title: string}) => string)
+  >(() => '')
+  useEffect(() => {
+    tooltipRenderRef.current = (
+      _event: unknown,
+      {items: _items, title}: {items: unknown[]; title: string},
+    ) => {
+      // We don't read `items`: G2's tooltip1d path can filter out
+      // zero-valued items in some configurations, so per-model values
+      // always come from `rowsByHourRef` (which we built to be exhaustive).
+      // We also rely on the static `colorRange` for swatches, so we don't
+      // need the colour info G2 attaches to each item either.
+      void _items
+
+      // G2's `MaybeTitle` transform ([maybeTitle.ts]) feeds the hovered
+      // x channel value into `title` as a stringified epoch-ms number
+      // (since our `hour` is a number, not a Date, the transform keeps
+      // it as-is rather than calling `dynamicFormatDateTime`). Parse
+      // it back so we can look the hour up in `rowsByHourRef`.
+      //
+      // Fall back to a Date parse so the same code keeps working if we
+      // later switch the row shape to Date objects.
+      let hour: number | undefined
+      if (title) {
+        const asNum = Number(title)
+        if (Number.isFinite(asNum) && asNum > 0) {
+          hour = asNum
+        } else {
+          const asDate = new Date(title).getTime()
+          if (Number.isFinite(asDate)) hour = asDate
+        }
+      }
+
+      const values = hour !== undefined ? rowsByHourRef.current.get(hour) : undefined
+
+      // Build one row per model, in legend order. We don't trust
+      // `items` for the per-model value lookup: G2 drops series with
+      // `value === undefined`, but a zero *is* kept. We want both to
+      // surface, so we read from `rowsByHourRef` and emit a row for
+      // every alias regardless of what G2 included in `items`.
+      const body = models
+        .map((model, idx) => {
+          const value = values?.get(model) ?? 0
+          const color = colorRange[idx] ?? PALETTE[idx % PALETTE.length]
+          return `<li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;line-height:2em;justify-content:space-between;white-space:nowrap;">
+  <span style="display:flex;align-items:center;max-width:220px;">
+    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;flex-shrink:0;"></span>
+    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${model}</span>
+  </span>
+  <span style="margin-left:24px;text-align:right;flex-shrink:0;">${formatNumber(value)}</span>
+</li>`
+        })
+        .join('')
+
+      // Re-use the existing title formatter so the header stays
+      // consistent with what the user already saw before this change.
+      const dt = hour !== undefined ? new Date(hour) : null
+      const hourLabel = dt && !Number.isNaN(dt.getTime())
+        ? windowHours === 24
+          ? `${String(dt.getHours()).padStart(2, '0')}:00`
+          : `${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')} ${String(dt.getHours()).padStart(2, '0')}:00`
+        : title || '—'
+      return `<div class="g2-tooltip">
+  <div class="g2-tooltip-title">${hourLabel}</div>
+  <ul class="g2-tooltip-list" style="margin:0;padding:0;list-style:none;">${body}</ul>
+</div>`
+    }
+  }, [models, colorRange, windowHours])
+
+  // Tooltip crosshairs + content visibility. The actual render lives in
+  // `interactionConfig.tooltip.render` below; sharing `shared: true`
+  // here is redundant (antd-plots' Line default already sets it) but
+  // keeps the intent local. We deliberately do NOT pass a `tooltip`
+  // prop with `customContent` — antd-charts@2 / G2 v5 ignore that field,
+  // and the default tooltip then renders a single summed header value.
   const tooltipConfig = useMemo(
     () => ({
       shared: true,
       showCrosshairs: true,
-      customContent: (title: string, items: unknown[]) => {
-        const rows = (items ?? []) as {
-          name?: string
-          value?: number
-          color?: string
-          data?: {hour?: number | string}
-        }[]
-        // `hour` is epoch ms (number) since we switched the row shape
-        // off ISO strings. Fall back to G2's default title (which it
-        // passes as the second arg) for safety.
-        const hourRow = rows[0]?.data
-        const raw = hourRow?.hour ?? title
-        const dt = raw !== undefined && raw !== null && raw !== '' ? new Date(raw) : null
-        const hourLabel = dt && !Number.isNaN(dt.getTime())
-          ? windowHours === 24
-            ? `${String(dt.getHours()).padStart(2, '0')}:00`
-            : `${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')} ${String(dt.getHours()).padStart(2, '0')}:00`
-          : '—'
-        const body = rows
-          .map(
-            (it) => `<li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;line-height:2em;justify-content:space-between;white-space:nowrap;">
-  <span style="display:flex;align-items:center;max-width:220px;">
-    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${it.color ?? '#1677ff'};margin-right:6px;flex-shrink:0;"></span>
-    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${it.name ?? '—'}</span>
-  </span>
-  <span style="margin-left:24px;text-align:right;flex-shrink:0;">${formatNumber(it.value ?? 0)}</span>
-</li>`,
-          )
-          .join('')
-        return `<div class="g2-tooltip">
-  <div class="g2-tooltip-title">${hourLabel}</div>
-  <ul class="g2-tooltip-list" style="margin:0;padding:0;list-style:none;">${body}</ul>
-</div>`
-      },
+      showContent: true,
     }),
-    [metric, windowHours],
+    [],
   )
 
   const interactionConfig = useMemo(
     () => ({
       tooltip: {
+        // antd-charts@2 / G2 v5 custom-render hook. The previous code
+        // put `customContent` on the top-level `tooltip` prop, but v5
+        // silently ignores that — leaving G2's default tooltip, which
+        // collapses every series into one summed header number (the
+        // 1787576400000 the user saw). `interaction.tooltip.render`
+        // is the supported API.
+        render: (
+          event: unknown,
+          options: {items: unknown[]; title: string},
+        ) => tooltipRenderRef.current(event, options),
         crosshairs: {
           type: 'x' as const,
           lineStroke: themeTokens.axis,
