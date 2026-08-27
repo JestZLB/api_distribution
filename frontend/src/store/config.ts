@@ -402,7 +402,7 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
   subscribeStatsEvents() {
     // The closure must access the store via `get()` (not via captured
     // references) so it always sees the latest state/methods.
-    return EventsOn('stats:changed', () => {
+    return subscribeOnce('stats', 'stats:changed', () => {
       void get()
         .refreshStatsWithComparison()
         .catch((err) => {
@@ -420,7 +420,7 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
     // it doesn't share a single hook with `stats:changed` (which would
     // cause every 2s heartbeat to trigger a full stats *and* logs
     // refetch, doubling IPC traffic on idle pages).
-    return EventsOn('logs:changed', () => {
+    return subscribeOnce('logs', 'logs:changed', () => {
       void get()
         .refreshLogs()
         .catch((err) => {
@@ -430,6 +430,61 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
     })
   },
 }))
+
+// Reference-counted single-flight subscription for Wails events.
+// Calling `subscribeOnce(key, eventName, cb)` returns an idempotent
+// unsubscribe: the FIRST caller actually invokes EventsOn; later callers
+// only bump the refcount. The unsubscribe returned to the LAST caller
+// is the one that ends up calling EventsOff.
+//
+// Why this matters: React StrictMode runs effects twice in development
+// (mount → unmount → mount) and Dashboard/page components mount/unmount
+// as the user navigates. If each component mount calls EventsOn and
+// each unmount calls EventsOff independently, a backend event can fire
+// while the listener is in the middle of being torn down, leading to
+// `Cannot read properties of null (reading 'nodes')` inside the Wails
+// runtime (the listener registry briefly holds a stale entry). Sharing a
+// single EventsOn per event name across the whole app sidesteps the race
+// entirely.
+const eventRegistry = new Map<string, {
+  refCount: number
+  unsubscribe: () => void
+}>()
+
+function subscribeOnce(
+  key: string,
+  eventName: string,
+  callback: () => void,
+): () => void {
+  const existing = eventRegistry.get(key)
+  if (existing) {
+    existing.refCount++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      existing.refCount--
+      if (existing.refCount === 0) {
+        existing.unsubscribe()
+        eventRegistry.delete(key)
+      }
+    }
+  }
+  const unsubscribe = EventsOn(eventName, callback)
+  eventRegistry.set(key, {refCount: 1, unsubscribe})
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const entry = eventRegistry.get(key)
+    if (!entry) return
+    entry.refCount--
+    if (entry.refCount === 0) {
+      entry.unsubscribe()
+      eventRegistry.delete(key)
+    }
+  }
+}
 
 /**
  * Cheap equality check for the stats shape: scalar totals + per-key

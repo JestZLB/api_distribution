@@ -175,11 +175,13 @@ func (s *Store) Recent(n int) []types.LogEntry {
 	return out
 }
 
-// Clear empties the log buffer and all accumulated statistics.
-// Hourly buckets are preserved. The dirty-range markers are reset to
-// 0 so a subsequent SaveLogs treats the (now-empty) buffer as fully
-// flushed, and the persisted logs table is wiped so a previous run's
-// rows do not come back on the next LoadLogs.
+// Clear empties the log buffer and all accumulated daily statistics.
+// Each DailyAgg carries its own hourly buckets, so dropping every
+// day also drops its hourly breakdown — there is no separate "hourly"
+// store. The dirty-range markers are reset to 0 so a subsequent
+// SaveLogs treats the (now-empty) buffer as fully flushed, and the
+// persisted logs table is wiped so a previous run's rows do not come
+// back on the next LoadLogs.
 func (s *Store) Clear() {
 	s.mu.Lock()
 	s.logs = s.logs[:0]
