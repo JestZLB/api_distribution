@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -691,5 +693,157 @@ func TestStatsWithComparison_RollingWindows(t *testing.T) {
 	}
 	if sc.PrevMonth.InputTokens != 400 || sc.PrevMonth.OutputTokens != 200 {
 		t.Errorf("PrevMonth tokens = %d/%d, want 400/200", sc.PrevMonth.InputTokens, sc.PrevMonth.OutputTokens)
+	}
+}
+
+// TestStats_ConcurrentAppendAndStats is the G-006 race-test
+// canary: 50 goroutines hammer Append with a single client-key
+// label while a coordinator goroutine continuously reads Stats /
+// StatsWithComparison. After 1s of pressure we assert that no
+// goroutine panicked, no race detector complaint fired, and the
+// per-key totals reported by Stats reflect the exact count of
+// appends the test executed (every Append is captured via an atomic
+// counter so the assertion is exact, not a probabilistic range).
+//
+// Run with `go test -race` to exercise the data-race detector;
+// this test deliberately uses overlapping RLock + Lock paths so any
+// future regression that removes the lock around the G-006
+// incrementals surfaces as a race report.
+func TestStats_ConcurrentAppendAndStats(t *testing.T) {
+	s := New()
+	now := time.Now()
+	const label = "race-key"
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var appendCount int64
+
+	go func() {
+		defer close(done)
+		const goroutines = 50
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for g := 0; g < goroutines; g++ {
+			go func() {
+				defer wg.Done()
+				i := 0
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					s.Append(types.LogEntry{
+						ID:             optID(i),
+						Timestamp:      now.UnixNano(),
+						Alias:          "race-alias",
+						ClientKeyLabel: label,
+						StatusCode:     200,
+					})
+					atomic.AddInt64(&appendCount, 1)
+					i++
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+
+	// Main goroutine reads Stats / StatsWithComparison concurrently
+	// for a 1s window to exercise the concurrent-read + write path.
+	// The final snapshot is taken AFTER all appenders have stopped
+	// (post close(stop) + <-done) so we can compare against the
+	// exact final appendCount without a race against the writers.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = s.Stats()
+		_ = s.StatsWithComparison()
+	}
+
+	close(stop)
+	<-done
+
+	// Final read, AFTER the appenders have stopped. This is the
+	// snapshot we compare to the final appendCount.
+	finalStats := s.Stats()
+	finalSwc := s.StatsWithComparison()
+
+	// Sanity-check final stats after the dust settles. With every
+	// Append using the same ClientKeyLabel, RequestsByClientKeyRecent
+	// must equal the total append count (all entries are in-window).
+	if got := finalStats.RequestsByClientKeyRecent[label]; got != appendCount {
+		t.Errorf("RequestsByClientKeyRecent[%q] = %d, want %d", label, got, appendCount)
+	}
+	if got := finalSwc.RequestsByClientKeyRecent[label]; got != appendCount {
+		t.Errorf("swc.RequestsByClientKeyRecent[%q] = %d, want %d", label, got, appendCount)
+	}
+	// TotalRequests (sumDays) must match too, otherwise something
+	// in the G-006 incrementals path silently dropped entries.
+	if got := finalStats.TotalRequests; got != appendCount {
+		t.Errorf("Stats.TotalRequests = %d, want %d", got, appendCount)
+	}
+	if got := finalSwc.TotalRequests; got != appendCount {
+		t.Errorf("swc.TotalRequests = %d, want %d", got, appendCount)
+	}
+}
+
+// TestStatsWithComparison_AfterAppend verifies that after a single
+// Append, a subsequent StatsWithComparison call observes the
+// incremented G-006 fields exactly once — no double counting and no
+// drops. The test uses deterministic, time-aligned entries so the
+// 24h window filter does not exclude the appended entry.
+func TestStatsWithComparison_AfterAppend(t *testing.T) {
+	s := New()
+	now := time.Now()
+	// Initial two entries: one in the last 24h, one outside.
+	s.Append(types.LogEntry{
+		ID:             "first-recent",
+		Timestamp:      now.UnixNano(),
+		Alias:          "alpha",
+		ClientKeyLabel: "keyA",
+		StatusCode:     200,
+	})
+	s.Append(types.LogEntry{
+		ID:             "first-old",
+		Timestamp:      now.Add(-48 * time.Hour).UnixNano(),
+		Alias:          "beta",
+		ClientKeyLabel: "keyB",
+		StatusCode:     200,
+	})
+
+	before := s.StatsWithComparison()
+	if before.TotalRequests != 2 {
+		t.Fatalf("baseline TotalRequests = %d, want 2", before.TotalRequests)
+	}
+	if before.RequestsByClientKeyRecent["keyA"] != 1 {
+		t.Fatalf("baseline RequestsByClientKeyRecent[keyA] = %d, want 1", before.RequestsByClientKeyRecent["keyA"])
+	}
+	if before.RequestsByClientKeyRecent["keyB"] != 0 {
+		t.Fatalf("baseline RequestsByClientKeyRecent[keyB] = %d, want 0", before.RequestsByClientKeyRecent["keyB"])
+	}
+
+	// Append a third entry — must increment exactly once.
+	s.Append(types.LogEntry{
+		ID:             "second-recent",
+		Timestamp:      now.UnixNano(),
+		Alias:          "alpha",
+		ClientKeyLabel: "keyA",
+		StatusCode:     200,
+	})
+
+	after := s.StatsWithComparison()
+	if after.TotalRequests != 3 {
+		t.Errorf("after Append TotalRequests = %d, want 3", after.TotalRequests)
+	}
+	if after.RequestsByClientKeyRecent["keyA"] != 2 {
+		t.Errorf("after Append RequestsByClientKeyRecent[keyA] = %d, want 2", after.RequestsByClientKeyRecent["keyA"])
+	}
+	if after.RequestsByClientKeyRecent["keyB"] != 0 {
+		t.Errorf("after Append RequestsByClientKeyRecent[keyB] = %d, want 0", after.RequestsByClientKeyRecent["keyB"])
+	}
+	// RequestsByModel["alpha"] must include both "first-recent" and
+	// "second-recent" (the G-006 todayByModel incrementals and the
+	// sumDays DailyAgg should agree).
+	if got := after.RequestsByModel["alpha"]; got != 2 {
+		t.Errorf("after Append RequestsByModel[alpha] = %d, want 2", got)
 	}
 }

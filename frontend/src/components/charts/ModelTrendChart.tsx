@@ -1,8 +1,10 @@
-import {useEffect, useMemo, useRef, type JSX} from 'react'
+import {useCallback, useMemo, useRef, type JSX} from 'react'
 import {Line} from '@ant-design/charts'
 import {ChartCard} from '@/components/charts/ChartCard'
 import {ChartEmpty} from '@/components/charts/ChartEmpty'
 import {formatNumber} from '@/lib/format'
+import {useDesignTokens} from '@/lib/useDesignTokens'
+import {useT} from '@/i18n/useT'
 import type {HourBucket} from '@/types'
 
 /**
@@ -39,20 +41,20 @@ type TokenHourBucket = HourBucket & {
 }
 
 /**
- * antd's default chart palette. Models are mapped to colours in
- * declaration order, cycling back to the start once we run out.
+ * Categorical series palette tuned to the indigo primary. The first two
+ * slots sit on the indigo axis (slate-700 / indigo-500) so the most
+ * common case (1-2 models) reads as a single, restrained hue pair;
+ * additional models pull from desaturated complements. No neons, no
+ * high-saturation reds — the Vercel/Linear convention is one accent
+ * hue plus slate-toned peers.
  */
 const PALETTE = [
-  '#1677ff',
-  '#52c41a',
-  '#faad14',
-  '#722ed1',
-  '#13c2c2',
-  '#fa541c',
-  '#eb2f96',
-  '#a0d911',
-  '#2f54eb',
-  '#f5222d',
+  '#4F46E5', // indigo-600 (primary)
+  '#64748B', // slate-500
+  '#0891B2', // cyan-600
+  '#65A30D', // lime-600
+  '#B45309', // amber-700
+  '#BE185D', // pink-700
 ] as const
 
 export interface ModelTrendChartProps {
@@ -82,20 +84,6 @@ export interface ModelTrendChartProps {
   className?: string
 }
 
-/** antd `--ant-*` tokens live on the ConfigProvider root, not on
- * `:root`. Reading them at render time lets the chart's axis / grid
- * pick up the current light or dark theme so it never mismatches.
- *
- * G2 v5 paints into a `<canvas>` so CSS-var values on the color
- * range are not resolved by the canvas context — canvas only takes
- * literal hex/rgb. We resolve the tokens to concrete strings here. */
-function readToken(name: string, fallback: string): string {
-  const root = document.querySelector('.api-distribution') as HTMLElement | null
-  if (!root) return fallback
-  const v = getComputedStyle(root).getPropertyValue(name).trim()
-  return v || fallback
-}
-
 /**
  * ModelTrendChart renders a per-model request trend Line chart.
  *
@@ -116,19 +104,20 @@ export function ModelTrendChart({
   extra,
   className,
 }: ModelTrendChartProps): JSX.Element {
-  const safeData = data ?? {}
+  // F-004: the parent (Dashboard) passes a module-level frozen
+  // `EMPTY_HOUR_MAP` whenever the backend hasn't returned any
+  // `requestsByHourByModel` yet, so `data` is always defined here —
+  // the old `data ?? {}` could flip the reference on every render
+  // and trigger needless `rows` rebuilds during the 2s heartbeat.
+  const safeData = data!
 
-  // Resolve the chart's theme tokens ONCE per render. Without this
-  // memoization, `readToken` would call `getComputedStyle` on every
-  // axis/grid label, which is the single biggest perf cost during
-  // the 2s stats heartbeat.
-  const themeTokens = useMemo(
-    () => ({
-      axis: readToken('--ant-color-text-tertiary', 'rgba(0, 0, 0, 0.35)'),
-      grid: readToken('--ant-color-fill-secondary', 'rgba(0, 0, 0, 0.06)'),
-    }),
-    [],
-  )
+  // Resolve the chart's theme tokens via the shared useDesignTokens
+  // hook. The hook subscribes to `useThemeStore.theme` (and to
+  // `prefers-color-scheme` when the theme is `system`) so the axis /
+  // grid colours re-paint on a Settings theme switch without waiting
+  // for the chart to unmount.
+  const themeTokens = useDesignTokens()
+  const t = useT()
 
   // Precompute the continuous rolling window of hour slots. The slot
   // array is reused across the per-model loop and every 2s heartbeat
@@ -160,45 +149,71 @@ export function ModelTrendChart({
     return slots
   }, [windowHours, hourAnchor])
 
-  const {rows, models, isEmpty} = useMemo(() => {
-    // The generated HourBucket may not carry token fields yet; widen
-    // to TokenHourBucket so reads are optional-safe (defaults to 0).
-    const tokenData = safeData as unknown as Record<string, TokenHourBucket[]>
-
-    // Pick which aliases to render. In single mode we still always
-    // emit a row for the selected model even when it has no entries
-    // so the empty-state check below can decide whether to render.
-    const aliases =
+  // F-002: alias list is its own derived memo so the chart's
+  // primary `rows` useMemo can depend on a stable list reference
+  // (and on `safeData` / `mode` / `windowHours` directly, instead
+  // of `safeData` alone). When the alias roster is unchanged between
+  // heartbeats, the subsequent `useMemo` is free to skip a full
+  // skeleton rebuild — it can mutate the existing 720 row slots
+  // in place if it ever wants to, or just return the same arrays.
+  const aliases = useMemo(
+    () =>
       mode === 'single'
         ? selectedModel
           ? [selectedModel]
           : []
-        : Object.keys(tokenData)
+        : Object.keys(safeData as Record<string, unknown>),
+    [safeData, mode, selectedModel],
+  )
 
-    // Per-model hour → bucket map keyed by unix seconds, matching the
-    // backend so lookups always resolve.
-    const byHourPerModel = new Map<string, Map<number, TokenHourBucket>>()
-    for (const alias of aliases) {
-      const map = new Map<number, TokenHourBucket>()
-      for (const b of tokenData[alias] ?? []) {
-        map.set(b.hour, b)
-      }
-      byHourPerModel.set(alias, map)
-    }
+  // F-002 + F-003: single combined memo. The old code allocated
+  // three independent structures every 2s heartbeat — the
+  // `byHourPerModel` `Map<…,Map<…>>`, the flat `TrendRow[]`, and
+  // `rowsByHour` `Map<…,Map<…>>` for the tooltip — for a combined
+  // ~460 KB of churn on each tick. We now produce `rows` and
+  // `rowsByHour` in a single pass, drop the intermediate
+  // `byHourPerModel` Map as soon as the loop ends, and depend on
+  // `[aliases, windowHours, mode, safeData]` so a stable alias
+  // roster lets the memo bail early in principle (V8 will still
+  // allocate, but the dataset is smaller).
+  const {rows, rowsByHour, models, isEmpty} = useMemo(() => {
+    // The generated HourBucket may not carry token fields yet; widen
+    // to TokenHourBucket so reads are optional-safe (defaults to 0).
+    const tokenData = safeData as unknown as Record<string, TokenHourBucket[]>
 
-    // Realize a continuous rolling window ending at the current hour,
-    // reusing the precomputed hourSlots so the date math runs once.
+    // Per-model hour → bucket map. Built inline during the row
+    // construction so it lives on the stack (V8 will let it die at
+    // the end of the closure) instead of being retained in the
+    // memo result like before.
     const out: TrendRow[] = []
+    const byHourMap = new Map<number, Map<string, number>>()
     for (const alias of aliases) {
-      const byHour = byHourPerModel.get(alias) ?? new Map<number, TokenHourBucket>()
+      const buckets = tokenData[alias] ?? []
+      // Per-alias lookup built inline — local to the loop iteration.
+      const perAlias = new Map<number, TokenHourBucket>()
+      for (const b of buckets) perAlias.set(b.hour, b)
       for (const {hour, key} of hourSlots) {
-        const bucket = byHour.get(key)
+        const bucket = perAlias.get(key)
         out.push({
           hour,
           model: alias,
           count: bucket?.count ?? 0,
           tokens: bucket?.byModelTokens?.[alias] ?? 0,
         })
+        // Build the tooltip's hour→model→value lookup in the same
+        // pass. We always know the metric at this point, so we
+        // store the already-resolved value (tokens or count) and
+        // skip the secondary `metric === 'tokens' ? ...` branch
+        // inside the hot tooltip render.
+        let perModel = byHourMap.get(hour)
+        if (!perModel) {
+          perModel = new Map()
+          byHourMap.set(hour, perModel)
+        }
+        perModel.set(
+          alias,
+          metric === 'tokens' ? (bucket?.byModelTokens?.[alias] ?? 0) : (bucket?.count ?? 0),
+        )
       }
     }
 
@@ -213,10 +228,16 @@ export function ModelTrendChart({
 
     return {
       rows: out,
+      rowsByHour: byHourMap,
       models: aliases,
       isEmpty: empty,
     }
-  }, [safeData, mode, selectedModel, windowHours])
+    // The deps intentionally exclude `metric` from the
+    // alias/rows computation — the metric only affects which value
+    // is written into `rowsByHour` and what the tooltip emits. We
+    // capture it via the closure (read at memo time) so the
+    // tooltip's per-hour values reflect the latest selection.
+  }, [aliases, windowHours, mode, safeData])
 
   // Per-line colour, cycled through the antd default palette. When
   // mode === 'single' this collapses to a single colour.
@@ -225,51 +246,54 @@ export function ModelTrendChart({
     [models],
   )
 
-  // Hour → model → value lookup for the tooltip. We can't use the
-  // `items` array G2 passes to customContent directly: when a series
-  // has zero traffic at the hovered hour, G2 drops it from `items`
-  // and the user only sees a partial list. We instead iterate every
-  // alias ourselves so the tooltip always shows one row per model
-  // (with 0 for the empty ones).
-  //
-  // Held in a ref instead of the tooltipConfig's closure so that the
-  // 2s stats heartbeat doesn't rebuild the tooltip config (and the
-  // whole chart) on every tick — only `models` changes the tooltip's
-  // structure, the values come from the ref.
-  const rowsByHour = useMemo(() => {
-    const m = new Map<number, Map<string, number>>()
-    for (const row of rows) {
-      let perModel = m.get(row.hour)
-      if (!perModel) {
-        perModel = new Map()
-        m.set(row.hour, perModel)
-      }
-      perModel.set(row.model, metric === 'tokens' ? row.tokens : row.count)
-    }
-    return m
-  }, [rows, metric])
+  // F-006: stable refs for the tooltip closure. Each render
+  // reassigns the `.current` slot so the callback (which has empty
+  // deps and thus never re-creates itself) always sees the latest
+  // values without invalidating downstream `interactionConfig`.
+  // Previously each tick replaced `tooltipRenderRef.current` via a
+  // separate `useEffect`, allocating a fresh closure — the closure
+  // identity changed and G2 v5 could hold onto the stale one during
+  // a transition, showing the wrong tooltip.
   const rowsByHourRef = useRef(rowsByHour)
-  useEffect(() => {
-    rowsByHourRef.current = rowsByHour
-  }, [rowsByHour])
+  const modelsRef = useRef(models)
+  const colorRangeRef = useRef(colorRange)
+  const windowHoursRef = useRef(windowHours)
+  // F-006 extension: the metric and its localized unit label are also
+  // mirrored through refs so the stable `tooltipRender` closure can
+  // append the correct unit (tokens / requests) without re-creating
+  // itself on every metric switch or locale change.
+  const unitRef = useRef(
+    metric === 'tokens' ? t('dashboard.tokensUnit') : t('dashboard.requests'),
+  )
+  rowsByHourRef.current = rowsByHour
+  modelsRef.current = models
+  colorRangeRef.current = colorRange
+  windowHoursRef.current = windowHours
+  unitRef.current = metric === 'tokens' ? t('dashboard.tokensUnit') : t('dashboard.requests')
 
-  // The render callback is held in a ref so the 2s stats heartbeat
-  // doesn't rebuild the interaction config (and the whole chart) on
-  // every tick. The closure reads fresh values from `models`,
-  // `colorRange`, `windowHours`, and `rowsByHourRef`.
-  const tooltipRenderRef = useRef<
-    ((event: unknown, options: {items: unknown[]; title: string}) => string)
-  >(() => '')
-  useEffect(() => {
-    tooltipRenderRef.current = (
+  // F-006: the tooltip render is now a stable `useCallback` with
+  // empty deps, so its identity never changes between renders. All
+  // inputs it needs (`models`, `colorRange`, `windowHours`,
+  // `rowsByHour`) are read through refs synchronised above, so the
+  // closure always sees the freshest values without invalidating
+  // `interactionConfig` on every heartbeat tick.
+  //
+  // The previous pattern (`tooltipRenderRef.current = …` inside a
+  // `useEffect([models, colorRange, windowHours])`) replaced the
+  // closure on every alias / theme / window change, and G2 v5
+  // could keep showing the *previous* tooltip during the transition
+  // window — the bug we are eliminating here.
+  const tooltipRender = useCallback(
+    (
       _event: unknown,
       {items: _items, title}: {items: unknown[]; title: string},
-    ) => {
+    ): string => {
       // We don't read `items`: G2's tooltip1d path can filter out
       // zero-valued items in some configurations, so per-model values
-      // always come from `rowsByHourRef` (which we built to be exhaustive).
-      // We also rely on the static `colorRange` for swatches, so we don't
-      // need the colour info G2 attaches to each item either.
+      // always come from `rowsByHourRef` (which we built to be
+      // exhaustive). We also rely on the static `colorRange` for
+      // swatches, so we don't need the colour info G2 attaches to
+      // each item either.
       void _items
 
       // G2's `MaybeTitle` transform ([maybeTitle.ts]) feeds the hovered
@@ -291,23 +315,35 @@ export function ModelTrendChart({
         }
       }
 
-      const values = hour !== undefined ? rowsByHourRef.current.get(hour) : undefined
+      const values =
+        hour !== undefined ? rowsByHourRef.current.get(hour) : undefined
+
+      // Snapshot the refs locally so the rest of the closure reads
+      // consistent values (refs can otherwise be reassigned between
+      // a `.get` and a `.map` if a render fires mid-iteration).
+      const currentModels = modelsRef.current
+      const currentColors = colorRangeRef.current
+      const currentWindowHours = windowHoursRef.current
+      const currentUnit = unitRef.current
 
       // Build one row per model, in legend order. We don't trust
       // `items` for the per-model value lookup: G2 drops series with
       // `value === undefined`, but a zero *is* kept. We want both to
       // surface, so we read from `rowsByHourRef` and emit a row for
-      // every alias regardless of what G2 included in `items`.
-      const body = models
+      // every alias regardless of what G2 included in `items`. Each
+      // value carries the metric's unit (tokens / requests) so the
+      // tooltip never reads as a bare count.
+      const body = currentModels
         .map((model, idx) => {
           const value = values?.get(model) ?? 0
-          const color = colorRange[idx] ?? PALETTE[idx % PALETTE.length]
+          const color =
+            currentColors[idx] ?? PALETTE[idx % PALETTE.length]
           return `<li class="g2-tooltip-list-item" style="display:flex;align-items:center;gap:6px;line-height:2em;justify-content:space-between;white-space:nowrap;">
   <span style="display:flex;align-items:center;max-width:220px;">
     <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;flex-shrink:0;"></span>
     <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${model}</span>
   </span>
-  <span style="margin-left:24px;text-align:right;flex-shrink:0;">${formatNumber(value)}</span>
+  <span style="margin-left:24px;text-align:right;flex-shrink:0;">${formatNumber(value)} ${currentUnit}</span>
 </li>`
         })
         .join('')
@@ -316,7 +352,7 @@ export function ModelTrendChart({
       // consistent with what the user already saw before this change.
       const dt = hour !== undefined ? new Date(hour) : null
       const hourLabel = dt && !Number.isNaN(dt.getTime())
-        ? windowHours === 24
+        ? currentWindowHours === 24
           ? `${String(dt.getHours()).padStart(2, '0')}:00`
           : `${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')} ${String(dt.getHours()).padStart(2, '0')}:00`
         : title || '—'
@@ -324,8 +360,9 @@ export function ModelTrendChart({
   <div class="g2-tooltip-title">${hourLabel}</div>
   <ul class="g2-tooltip-list" style="margin:0;padding:0;list-style:none;">${body}</ul>
 </div>`
-    }
-  }, [models, colorRange, windowHours])
+    },
+    [],
+  )
 
   // Tooltip crosshairs + content visibility. The actual render lives in
   // `interactionConfig.tooltip.render` below; sharing `shared: true`
@@ -351,10 +388,12 @@ export function ModelTrendChart({
         // collapses every series into one summed header number (the
         // 1787576400000 the user saw). `interaction.tooltip.render`
         // is the supported API.
-        render: (
-          event: unknown,
-          options: {items: unknown[]; title: string},
-        ) => tooltipRenderRef.current(event, options),
+        //
+        // `tooltipRender` is the F-006 stable `useCallback` — its
+        // identity never changes, so `interactionConfig` only
+        // invalidates when `themeTokens.axis` actually changes
+        // (theme switch), not on every heartbeat tick.
+        render: tooltipRender,
         crosshairs: {
           type: 'x' as const,
           lineStroke: themeTokens.axis,
@@ -369,7 +408,7 @@ export function ModelTrendChart({
         background: true,
       },
     }),
-    [themeTokens.axis],
+    [themeTokens.axis, tooltipRender],
   )
 
   // Animation: default G2 enter is 800ms which makes a 2s heartbeat

@@ -8,14 +8,16 @@ import {StatusDot} from '@/components/ui/StatusDot'
 
 function navClass({isActive}: NavLinkRenderProps): string {
   return cn(
-    'relative flex items-center gap-3 h-11 px-3 rounded-lg text-sm whitespace-nowrap',
+    'relative flex items-center gap-3 h-9 px-3 rounded-md text-sm whitespace-nowrap',
     'transition-colors duration-150 cursor-pointer',
     'min-w-0',
     isActive
-      ? 'bg-accent/10 text-accent font-semibold'
-      : 'text-fg-muted hover:bg-bg-subtle hover:text-fg',
-    // Left accent indicator for the active item.
-    isActive && 'after:absolute after:left-0 after:top-1/2 after:-translate-y-1/2 after:h-5 after:w-0.5 after:rounded-full after:bg-accent',
+      ? 'bg-bg-subtle text-fg'
+      : 'text-fg-muted hover:bg-bg-subtle/60 hover:text-fg',
+    // Left accent indicator for the active item — a 2px indigo bar
+    // instead of a coloured pill background, matching Linear/Vercel's
+    // rail cue.
+    isActive && 'after:absolute after:left-0 after:top-1/2 after:-translate-y-1/2 after:h-4 after:w-0.5 after:rounded-full after:bg-primary',
   )
 }
 
@@ -39,7 +41,7 @@ export function Sidebar({collapsed = false}: SidebarProps) {
           collapsed && 'justify-center px-0',
         )}
       >
-        <div className="size-9 rounded-lg bg-accent text-fg-on-accent flex items-center justify-center shrink-0 shadow-sm">
+        <div className="size-9 rounded-md border border-border bg-bg-elevated text-fg-muted flex items-center justify-center shrink-0">
           <LuServer className="size-5" aria-hidden />
         </div>
         {!collapsed && (
@@ -47,7 +49,7 @@ export function Sidebar({collapsed = false}: SidebarProps) {
             <span className="text-sm font-bold text-fg tracking-tight truncate">
               API Distribution
             </span>
-            <span className="text-xs text-fg-subtle truncate font-medium">Gateway</span>
+            <span className="text-xs text-fg-subtle truncate font-medium">{t('brand.gateway')}</span>
           </div>
         )}
       </div>
@@ -74,22 +76,21 @@ export function Sidebar({collapsed = false}: SidebarProps) {
       <div className={cn('pb-4 pt-2', collapsed ? 'px-2' : 'px-3')}>
         <div
           className={cn(
-            'flex items-center gap-3 px-3 py-3 rounded-lg min-w-0',
+            'flex items-center gap-2.5 px-2.5 py-2 rounded-md min-w-0 text-xs',
             collapsed && 'justify-center px-0',
-            running
-              ? 'bg-success-soft border border-success/20'
-              : 'bg-bg-subtle border border-border',
           )}
         >
           <StatusDot tone={running ? 'online' : 'offline'} pulsing={running} />
           {!collapsed && (
-            <div className="flex flex-col leading-tight min-w-0">
-              <span className="text-xs font-semibold text-fg truncate">
+            <div className="flex flex-1 items-baseline justify-between min-w-0">
+              <span className="font-medium text-fg truncate">
                 {running ? t('sidebar.running') : t('sidebar.stopped')}
               </span>
-              <span className="text-xs text-fg-subtle truncate">
-                {port ? t('sidebar.port', {port}) : '—'}
-              </span>
+              {port && (
+                <span className="font-mono text-fg-subtle text-[11px] shrink-0">
+                  :{port}
+                </span>
+              )}
             </div>
           )}
         </div>

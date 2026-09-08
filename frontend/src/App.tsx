@@ -1,10 +1,8 @@
-import {useEffect, useMemo, useState} from 'react'
+import {lazy, Suspense, useEffect, useMemo, useState} from 'react'
 import {HashRouter, Route, Routes, Navigate} from 'react-router-dom'
 import {App as AntApp, ConfigProvider} from 'antd'
 import {AppShell} from '@/components/layout/AppShell'
 import {Dashboard} from '@/pages/Dashboard'
-import {Providers} from '@/pages/Providers'
-import {Models} from '@/pages/Models'
 import {Logs} from '@/pages/Logs'
 import {Settings} from '@/pages/Settings'
 import {ErrorBoundary} from '@/components/ErrorBoundary'
@@ -15,6 +13,17 @@ import {useConfigStore} from '@/store/config'
 import * as WailsApp from '../wailsjs/go/main/App'
 import {getAntdTheme} from '@/lib/antdTheme'
 import {MessageHolder} from '@/components/MessageHolder'
+
+// F-019: defer the Models / Providers bundles until the user
+// navigates to them for the first time. The Dashboard is the
+// landing page and already lazy-imports its own chart chunks,
+// while Logs and Settings are tiny enough to keep eager.
+//
+// Both Models and Providers export their page components as named
+// exports, so each lazy() thunk re-shapes the dynamic import into
+// `{ default }` form — otherwise React.lazy rejects the module.
+const Models = lazy(() => import('@/pages/Models').then((m) => ({default: m.Models})))
+const Providers = lazy(() => import('@/pages/Providers').then((m) => ({default: m.Providers})))
 
 type ResolvedMode = 'light' | 'dark'
 
@@ -72,16 +81,18 @@ export default function App() {
           <ErrorBoundary>
             <BootErrorScreen />
             <MessageHolder />
-            <Routes>
-              <Route element={<AppShell/>}>
-                <Route index element={<Navigate to="/dashboard" replace/>}/>
-                <Route path="/dashboard" element={<Dashboard/>}/>
-                <Route path="/providers" element={<Providers/>}/>
-                <Route path="/models" element={<Models/>}/>
-                <Route path="/logs" element={<Logs/>}/>
-                <Route path="/settings" element={<Settings/>}/>
-              </Route>
-            </Routes>
+            <Suspense fallback={<div className="p-6 text-fg-muted text-sm" />}>
+              <Routes>
+                <Route element={<AppShell/>}>
+                  <Route index element={<Navigate to="/dashboard" replace/>}/>
+                  <Route path="/dashboard" element={<Dashboard/>}/>
+                  <Route path="/providers" element={<Providers/>}/>
+                  <Route path="/models" element={<Models/>}/>
+                  <Route path="/logs" element={<Logs/>}/>
+                  <Route path="/settings" element={<Settings/>}/>
+                </Route>
+              </Routes>
+            </Suspense>
           </ErrorBoundary>
         </HashRouter>
       </AntApp>

@@ -66,14 +66,16 @@ export function TopBar({collapsed = false, onToggle}: TopBarProps) {
 
   const statusLabel = useMemo(
     () => (running ? t('sidebar.running') : t('sidebar.stopped')),
-    [running, t],
+    // `t` is a stable reference (useCallback with `[]` deps inside
+    // useT); the memo only needs to re-derive when `running` changes.
+    [running],
   )
 
   return (
     <header
       className={cn(
         'flex items-center justify-between gap-4 h-16 px-6',
-        'bg-bg-elevated border-b border-border',
+        'glass-surface border-b border-border',
       )}
     >
       <div className="flex items-center gap-4 min-w-0">
@@ -100,16 +102,13 @@ export function TopBar({collapsed = false, onToggle}: TopBarProps) {
         >
           <div
             className={cn(
-              'inline-flex items-center gap-2 h-10 px-3 rounded-lg text-xs font-medium',
-              running
-                ? 'bg-success-soft border border-success/25 text-fg'
-                : 'bg-bg-subtle border border-border text-fg-muted',
+              'inline-flex items-center gap-2 h-9 px-3 rounded-md text-xs font-medium',
+              'border border-border bg-bg-elevated',
             )}
             aria-label={`Gateway ${statusLabel}${port ? `, port ${port}` : ''}`}
           >
-            <LuServer className={cn('size-4', running ? 'text-success' : 'text-fg-subtle')} aria-hidden />
             <StatusDot tone={running ? 'online' : 'offline'} pulsing={running} />
-            <span className="hidden sm:inline truncate">
+            <span className="hidden sm:inline text-fg truncate">
               {port ? `:${port}` : statusLabel}
             </span>
           </div>

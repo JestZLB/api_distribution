@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,38 +92,6 @@ func TestStartStop_Idempotent(t *testing.T) {
 	}
 }
 
-// TestStreamResponse_Flushes verifies the non-Anthropic streaming
-// path types-asserts http.Flusher and pushes each chunk to the wire
-// before the handler returns. Without flushing, chunks would sit in
-// net/http's internal 4 KiB buffer until the handler exits.
-func TestStreamResponse_Flushes(t *testing.T) {
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	src := strings.NewReader("hello world")
-
-	s := &Server{}
-	s.streamResponse(w, src)
-
-	if w.flushed == 0 {
-		t.Fatal("expected at least one Flush call, got none")
-	}
-	if w.Body.String() != "hello world" {
-		t.Errorf("body = %q, want %q", w.Body.String(), "hello world")
-	}
-}
-
-// flushRecorder wraps httptest.ResponseRecorder to count Flush calls.
-// httptest.ResponseRecorder already implements http.Flusher.
-type flushRecorder struct {
-	*httptest.ResponseRecorder
-	flushed int
-}
-
-func (f *flushRecorder) Flush() {
-	f.flushed++
-	// httptest.ResponseRecorder.Flush is a no-op, but the embed
-	// already forwards headers/body writes via the shared fields.
-}
-
 // TestStreamResponseWithUsage verifies that streamResponseWithUsage
 // correctly parses SSE chunks, extracts usage from the final chunk,
 // and forwards all data lines to the response writer.
@@ -196,19 +166,17 @@ func TestStreamResponseWithUsage_CleanEOF(t *testing.T) {
 	}
 }
 
-// TestStreamResponseWithUsage_ScanError verifies that when the
-// upstream sends a line longer than bufio.Scanner's default 64 KiB
-// buffer, the resulting Err() is captured into log.Error so
-// operators can spot a broken upstream instead of silently swallowing
-// the failure.
-func TestStreamResponseWithUsage_ScanError(t *testing.T) {
-	// One line that exceeds bufio.Scanner's max token size (1 MiB, set in
-	// streamResponseWithUsage), followed by EOF — guarantees scanner.Scan()
-	// returns false with scanner.Err() == bufio.ErrTooLong.
+// TestStreamResponseWithUsage_LongLine verifies that a single SSE
+// frame larger than the old scanner-based implementation's 1 MiB max
+// token size is forwarded whole: bufio.Reader grows its internal
+// buffer, so an arbitrarily long line is relayed without truncation,
+// and no error is flagged because long lines are supported by design.
+func TestStreamResponseWithUsage_LongLine(t *testing.T) {
+	// One data line exceeding the old 1 MiB scanner cap, followed by a
+	// clean [DONE] — the new implementation must forward it intact and
+	// end the stream without recording an error.
 	oversized := "data: " + strings.Repeat("x", 2*1024*1024) + "\n"
-	// Need a trailing newline + data line for Scan to attempt the
-	// oversized line and then fail on the next read.
-	src := strings.NewReader(oversized + "data: short\n")
+	src := strings.NewReader(oversized + "data: [DONE]\n\n")
 
 	log := &types.LogEntry{}
 	w := httptest.NewRecorder()
@@ -216,8 +184,14 @@ func TestStreamResponseWithUsage_ScanError(t *testing.T) {
 
 	s.streamResponseWithUsage(w, src, log)
 
-	if log.Error == "" {
-		t.Errorf("expected log.Error to capture scanner.Err(), got empty")
+	if !strings.Contains(w.Body.String(), strings.Repeat("x", 2*1024*1024)) {
+		t.Errorf("oversized line was truncated or dropped")
+	}
+	if !strings.Contains(w.Body.String(), "data: [DONE]") {
+		t.Errorf("missing [DONE] in output")
+	}
+	if log.Error != "" {
+		t.Errorf("expected no log.Error for a clean long-line stream, got %q", log.Error)
 	}
 }
 
@@ -313,9 +287,40 @@ func TestListModels_RequiresAuth(t *testing.T) {
 	}
 }
 
-// TestBodyLimit_ChatCompletions verifies that requests with an
-// oversized body receive 413 Request Entity Too Large.
+// TestBodyLimit_ChatCompletions verifies that requests exceeding the
+// configured MaxRequestBodyMB receive 413 Request Entity Too Large.
 func TestBodyLimit_ChatCompletions(t *testing.T) {
+	dir := t.TempDir()
+	mgr := config.New(dir)
+	if _, err := mgr.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := mgr.Save(types.Config{
+		ServerHost:       "127.0.0.1",
+		ServerPort:       0,
+		MaxRequestBodyMB: 1,
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	srv := New(mgr, store.New())
+
+	big := strings.Repeat("x", 2<<20+1) // 2 MiB + 1, over the 1 MiB limit
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/chat/completions", strings.NewReader(big))
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestBodyLimit_DefaultDoesNotRejectLongContext verifies the gateway
+// no longer enforces the old 10 MiB hard ceiling: a body above 10 MiB
+// passes the body-limit gate (and only then fails JSON parsing / alias
+// resolution with 400, never 413). This is the "context limits are the
+// client's job, not the gateway's" contract.
+func TestBodyLimit_DefaultDoesNotRejectLongContext(t *testing.T) {
 	dir := t.TempDir()
 	mgr := config.New(dir)
 	if _, err := mgr.Load(); err != nil {
@@ -329,18 +334,99 @@ func TestBodyLimit_ChatCompletions(t *testing.T) {
 	}
 
 	srv := New(mgr, store.New())
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = srv.Stop() })
 
-	st := srv.Status()
-	big := strings.Repeat("x", 10<<20+1)
-	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/v1/chat/completions", st.BaseURL[len("http://"):]), strings.NewReader(big))
+	big := strings.Repeat("x", 10<<20+1) // exceeds the old 10 MiB cap
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/chat/completions", strings.NewReader(big))
 	w := httptest.NewRecorder()
 	srv.handleChatCompletions(w, req)
 
-	if w.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("status = %d, want 413; body: %s", w.Code, w.Body.String())
+	if w.Code == http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, body limit rejected a >10 MiB body", w.Code)
+	}
+	// The oversized-but-invalid JSON should fail later in the pipeline
+	// (extractModel) with 400, proving the body-limit gate passed it.
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (invalid JSON after body gate); body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestAnthropicChat_DropsUpstreamContentLength verifies that the
+// Anthropic conversion path never forwards the upstream's
+// Content-Length header. The upstream body is re-encoded into the
+// OpenAI response shape below, whose byte length differs, so a stale
+// Content-Length would hang or truncate the client.
+func TestAnthropicChat_DropsUpstreamContentLength(t *testing.T) {
+	anthResp := `{"id":"msg_01","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Writing the full body in one call lets Go set Content-Length.
+		_, _ = io.WriteString(w, anthResp)
+	}))
+	defer up.Close()
+
+	dir := t.TempDir()
+	mgr := config.New(dir)
+	if _, err := mgr.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	srv := New(mgr, store.New())
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req = req.WithContext(context.WithValue(req.Context(), authRequiredKey, true))
+	w := httptest.NewRecorder()
+
+	provider := types.Provider{
+		ID:      "prov-content-length-test",
+		Name:    "cl-content-length",
+		Type:    types.ProviderAnthropic,
+		BaseURL: up.URL,
+		APIKey:  "sk-test",
+	}
+	var log types.LogEntry
+	srv.handleAnthropicChat(w, req, []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`),
+		false, provider, &log)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+	}
+	if cl := w.Header().Get("Content-Length"); cl != "" {
+		t.Errorf("Content-Length = %q, want empty (must be recomputed after body transform)", cl)
+	}
+
+	// The relayed body must be the converted OpenAI shape, not the raw
+	// upstream Anthropic body.
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode converted body: %v\n%s", err, w.Body.String())
+	}
+	if out["object"] != "chat.completion" {
+		t.Errorf("object = %v, want chat.completion", out["object"])
+	}
+}
+
+// TestStreamResponseWithUsage_LongLineNotTruncated verifies a single
+// SSE data line larger than the old 1 MiB cap is forwarded whole
+// instead of truncating/dropping the stream.
+func TestStreamResponseWithUsage_LongLineNotTruncated(t *testing.T) {
+	// ~1.3 MiB line, comfortably above the former sseMaxLineBytes.
+	huge := strings.Repeat("Z", 1<<19+1<<20)
+	sse := "data: " + huge + "\n\ndata: [DONE]\n\n"
+
+	w := httptest.NewRecorder()
+	srv := &Server{}
+	var log types.LogEntry
+	srv.streamResponseWithUsage(w, strings.NewReader(sse), &log)
+
+	out := w.Body.String()
+	if !strings.Contains(out, huge) {
+		t.Errorf("long SSE line was truncated (out len=%d)", len(out))
+	}
+	if log.Error != "" {
+		t.Errorf("log.Error set: %v", log.Error)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("missing [DONE] terminator")
 	}
 }

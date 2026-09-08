@@ -4,26 +4,39 @@ import {App as AntApp, Button, Card, Typography} from 'antd'
 import {useConfigStore} from '@/store/config'
 import {useT} from '@/i18n/useT'
 
-export function BootErrorScreen() {
+/**
+ * Always-mounted sentinel that renders nothing. Subscribes to nothing,
+ * allocates nothing — its only purpose is to occupy the slot next to
+ * the rest of the app shell so the (more expensive) `BootErrorDetail`
+ * can be conditionally mounted in its place.
+ */
+function BootErrorPlaceholder(): null {
+  return null
+}
+
+/**
+ * Heavy child: only mounted when `BootErrorScreen` (its parent) decides
+ * an error UI is actually needed. Owns the original UI plus the 5
+ * atomic selectors that drive the gating decision + the data selectors
+ * the UI consumes. In the steady-state `bootStatus === 'ready'` path
+ * this component is never mounted, so its subscriptions and DOM are
+ * not paid for.
+ */
+function BootErrorDetail({
+  showFatal,
+  showDegraded,
+}: {
+  showFatal: boolean
+  showDegraded: boolean
+}) {
   const {message} = AntApp.useApp()
-  const bootStatus = useConfigStore((s) => s.bootStatus)
   const bootError = useConfigStore((s) => s.bootError)
   const lastLoadedAt = useConfigStore((s) => s.lastLoadedAt)
   const load = useConfigStore((s) => s.load)
-  const refreshErrors = useConfigStore((s) => s.refreshErrors)
   const t = useT()
   const [retrying, setRetrying] = useState(false)
   const isDev =
     typeof window !== 'undefined' && !window.location.protocol.startsWith('wails')
-
-  // While we are still attempting to load, show nothing — pages render
-  // their own skeletons / states. Only render the full-page error when
-  // bootStatus has resolved to 'failed' or 'degraded'.
-  const showFatal = bootStatus === 'failed'
-  const showDegraded =
-    bootStatus === 'degraded' || (bootStatus === 'ready' && Object.values(refreshErrors).some(Boolean))
-
-  if (!showFatal && !showDegraded) return null
 
   async function handleRetry() {
     setRetrying(true)
@@ -39,7 +52,7 @@ export function BootErrorScreen() {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg p-6">
-        <Card className="w-full max-w-lg!">         
+        <Card className="w-full max-w-lg!">
         <div className="flex items-center gap-3">
           <div className="size-10 rounded-lg bg-danger-soft flex items-center justify-center shrink-0">
             <LuCircleAlert className="size-5 text-danger" />
@@ -83,4 +96,32 @@ export function BootErrorScreen() {
       </Card>
     </div>
   )
+}
+
+/**
+ * Main entry. Subscribes to the 5 atomic gating selectors
+ * (`bootStatus` + 4 per-slice refresh error flags) so transient errors
+ * in any one slice do not invalidate unrelated subscribers, then
+ * decides between the always-mounted (no-op) `BootErrorPlaceholder` and
+ * the heavy `BootErrorDetail`. The detail component is only mounted
+ * when an error UI is actually needed.
+ */
+export function BootErrorScreen() {
+  const bootStatus = useConfigStore((s) => s.bootStatus)
+  const refreshErrorStats = useConfigStore((s) => s.refreshErrorStats)
+  const refreshErrorLogs = useConfigStore((s) => s.refreshErrorLogs)
+  const refreshErrorServer = useConfigStore((s) => s.refreshErrorServer)
+  const refreshErrorLoad = useConfigStore((s) => s.refreshErrorLoad)
+
+  // Aggregate per-slice refresh errors into a single boolean so the
+  // transient banner can surface without forcing the placeholder to
+  // subscribe to a single combined object (which would invalidate on
+  // every slice's flip).
+  const anyRefreshError =
+    !!refreshErrorStats || !!refreshErrorLogs || !!refreshErrorServer || !!refreshErrorLoad
+  const showFatal = bootStatus === 'failed'
+  const showDegraded = bootStatus === 'degraded' || (bootStatus === 'ready' && anyRefreshError)
+
+  if (!showFatal && !showDegraded) return <BootErrorPlaceholder />
+  return <BootErrorDetail showFatal={showFatal} showDegraded={showDegraded} />
 }

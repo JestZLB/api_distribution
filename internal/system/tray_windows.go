@@ -169,7 +169,6 @@ type winTray struct {
 	tip     string
 	locale  string // BCP-47 tag; "" → en-US fallback for menu labels
 	iconPng []byte // appicon.png bytes; used to build the HICON
-	stopCh  chan struct{}
 	done    chan struct{}
 	ready   chan error
 }
@@ -206,7 +205,6 @@ func (t *winTray) Start(tooltip string, cb TrayCallbacks) error {
 	}
 	t.cb = cb
 	t.tip = tooltip
-	t.stopCh = make(chan struct{})
 	t.done = make(chan struct{})
 	t.ready = make(chan error, 1)
 	t.mu.Unlock()
@@ -235,7 +233,11 @@ func (t *winTray) Stop() {
 		t.mu.Unlock()
 		return
 	}
-	close(t.stopCh)
+	// Disconnect the callback reference FIRST so any in-flight event
+	// from the pump cannot reach back into the trayForwarder / App
+	// during the shutdown grace period (otherwise the App is held
+	// alive until the timeout fires).
+	t.cb = nil
 	done := t.done
 	t.running = false
 	t.mu.Unlock()

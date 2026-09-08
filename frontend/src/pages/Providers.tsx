@@ -1,4 +1,4 @@
-import {useEffect, useMemo, useState} from 'react'
+import {useEffect, useMemo, useRef, useState} from 'react'
 import {
   LuCircleCheck,
   LuCopy,
@@ -79,9 +79,22 @@ export function Providers() {
   const [testing, setTesting] = useState<string | null>(null)
   const [typeOptions, setTypeOptions] = useState(FALLBACK_TYPE_OPTIONS)
 
+  // Tracks whether the in-flight provider editor has been touched since
+  // it was opened. Set to `true` from the `ProviderForm`'s onChange
+  // wrapper (see below) and reset to `false` by `openEditor`. The
+  // previous implementation compared the entire `editing` and
+  // `initialEditing` with `JSON.stringify` on every close attempt,
+  // which scaled with the provider's models list and notes for no UI
+  // benefit — a boolean ref is enough to decide whether to prompt.
+  const editingDirtyRef = useRef(false)
+
   const [drawerWidth, setDrawerWidth] = useState<number | '100%'>(520)
   useEffect(() => {
-    const update = () => setDrawerWidth(window.innerWidth < 600 ? '100%' : 520)
+    const update = () =>
+      setDrawerWidth((prev) => {
+        const next = window.innerWidth < 600 ? '100%' : 520
+        return prev === next ? prev : next
+      })
     update()
     window.addEventListener('resize', update)
     return () => window.removeEventListener('resize', update)
@@ -122,6 +135,9 @@ export function Providers() {
       message.success(t('toast.providerSaved'))
       setEditing(null)
       setInitialEditing(null)
+      // Saved cleanly — drop the dirty flag so a re-open doesn't
+      // immediately prompt for unsaved changes.
+      editingDirtyRef.current = false
     } catch (e) {
       message.error(`${t('toast.providers.saveFailed')}: ${String(e)}`)
     }
@@ -130,10 +146,15 @@ export function Providers() {
   function openEditor(provider: Provider) {
     setEditing(provider)
     setInitialEditing(provider)
+    // Fresh edit session: no onChange has fired yet.
+    editingDirtyRef.current = false
   }
 
   function tryCloseEditor() {
-    const dirty = editing && initialEditing && JSON.stringify(editing) !== JSON.stringify(initialEditing)
+    // Read the boolean ref instead of running two full JSON.stringify
+    // round-trips over the entire provider (including its models list
+    // and notes) every time the user clicks Cancel / closes the drawer.
+    const dirty = editingDirtyRef.current
     if (dirty) {
       modal.confirm({
         title: t('providers.form.discardConfirm'),
@@ -154,6 +175,8 @@ export function Providers() {
   function discardAndClose() {
     setEditing(null)
     setInitialEditing(null)
+    // Reset so the next session starts clean.
+    editingDirtyRef.current = false
   }
 
   function confirmDelete(p: Provider) {
@@ -262,7 +285,12 @@ export function Providers() {
         {editing && (
           <ProviderForm
             provider={editing}
-            onChange={setEditing}
+            onChange={(next) => {
+              // First user-driven edit in this session flips the
+              // dirty flag; subsequent edits just keep it true.
+              editingDirtyRef.current = true
+              setEditing(next)
+            }}
             typeOptions={typeOptions}
           />
         )}

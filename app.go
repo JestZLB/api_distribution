@@ -67,15 +67,30 @@ type App struct {
 	trayStarted bool
 	autoStart   system.AutoStart
 	tray        system.Tray
+
+	// doneCh is closed by App.shutdown to signal every background
+	// goroutine that the process is exiting. Each loop selects on
+	// both <-a.ctx.Done() and <-a.doneCh so shutdown can drive a
+	// deterministic exit without racing the Wails-provided ctx.
+	// Initialized in startup() (we need a.ctx first so the loops can
+	// safely read both signals).
+	doneCh chan struct{}
+
+	// loopWG tracks the three long-lived loops (emitLogsLoop,
+	// persistLogsLoop, reapClientsLoop). shutdown closes doneCh, then
+	// waits up to 200ms for them all to return so flushPersisted() and
+	// store.Close() can run without a concurrent Append touching the
+	// dirty-range markers.
+	loopWG sync.WaitGroup
 }
 
 const (
 	// upstreamReapInterval controls how often the background goroutine
 	// scans the upstream client cache for idle entries.
-	upstreamReapInterval = 5 * time.Minute
+	upstreamReapInterval = 1 * time.Minute
 	// upstreamReapIdle is how long an upstream client may sit unused
 	// before it is evicted and its idle connections closed.
-	upstreamReapIdle = 15 * time.Minute
+	upstreamReapIdle = 5 * time.Minute
 )
 
 // NewApp creates a new App with persistent config in dir.
@@ -108,6 +123,7 @@ func NewApp(dir string) *App {
 // startup is called when the Wails app is ready.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.doneCh = make(chan struct{})
 
 	// One-time migration from the legacy JSON persistence layout
 	// (logs.json + stats/*.json) into the SQLite database. It is
@@ -185,35 +201,92 @@ func (a *App) startup(ctx context.Context) {
 	go a.reapClientsLoop()
 }
 
-// shutdown is called when Wails is closing.
+// shutdown is called when Wails is closing. The sequence is
+// deterministic and bounded so a Wails-side Quit never blocks the
+// event loop for more than ~1.5s:
+//
+//  1. proxy.Stop() — refuses any new inbound request and waits up to
+//     its 5s ShutdownTimeoutSec for in-flight streams to drain;
+//  2. close(doneCh) — signals the three background loops to exit;
+//  3. loopWG.Wait with a 200ms ceiling — give the loops a chance to
+//     finish their final tick (emit, persist, reap). The Wait is
+//     non-blocking past 200ms via time.After so shutdown never
+//     stalls behind a slow ticker;
+//  4. flushPersisted() — single, flushMu-serialized write of the
+//     dirty log range and per-day aggregates. We do NOT call
+//     store.SaveLogs/SaveDaily directly because those race with
+//     persistLogsLoop's own flush on the dirty-range markers; the
+//     helper owns the serialization;
+//  5. go a.tray.Stop() — fire-and-forget the tray teardown so a
+//     slow PostQuitMessage (Windows can take ~500ms) does not
+//     inflate the shutdown wall-clock;
+//  6. store.Close() — release the SQLite handle last so the flush
+//     above has a live connection;
+//  7. upstream.ReapIdle(0) — force-close cached upstream idle conns.
 func (a *App) shutdown(_ context.Context) {
+	// (1) Stop accepting new proxy traffic.
 	_ = a.proxy.Stop()
 
-	// Stop the tray icon (if started) so Windows does not leave a
-	// dangling icon after the process exits. tray.Stop is best-effort
-	// and bounded by the tray's own internal timeout (see
-	// internal/system/tray_windows.go).
+	// (2) Signal all background loops to exit. Safe to call multiple
+	// times — close of a nil channel panics, so we only do it once
+	// and only after startup has populated doneCh.
+	if a.doneCh != nil {
+		select {
+		case <-a.doneCh:
+			// already closed (e.g. unit test calling shutdown twice)
+		default:
+			close(a.doneCh)
+		}
+	}
+
+	// (3) Wait up to 200ms for the loops to finish. We do NOT block on
+	// loopWG.Wait alone because a stuck loop (e.g. disk full on the
+	// flush) would wedge the Wails shutdown indefinitely. A goroutine
+	// + time.After gives us a non-blocking ceiling.
+	doneWaiting := make(chan struct{})
+	go func() {
+		a.loopWG.Wait()
+		close(doneWaiting)
+	}()
+	select {
+	case <-doneWaiting:
+	case <-time.After(200 * time.Millisecond):
+		// proceed anyway; flushPersisted + store.Close are still
+		// safe to call concurrently with the lingering loops.
+	}
+
+	// (4) Serialized final flush. flushMu ensures this and the
+	// persistLogsLoop's exit-flush do not interleave two SaveLogs.
+	a.flushPersisted()
+
+	// (5) Tray teardown off the critical path. tray.Stop internally
+	// waits up to 500ms for the Win32 pump to drain; we do not want
+	// that on the shutdown wall-clock. The goroutine outlives this
+	// function but the process exits right after, so the leak window
+	// is bounded.
 	a.mu.Lock()
 	ts := a.trayStarted
 	a.mu.Unlock()
 	if ts && a.tray != nil {
-		a.tray.Stop()
+		go func() {
+			a.tray.Stop()
+		}()
 	}
 
-	// Persist logs to disk on shutdown so we don't lose data.
-	if err := a.store.SaveLogs(); err != nil {
-		fmt.Println("warning: save logs:", err)
-	}
-	// Persist per-date stats on shutdown too.
-	if err := a.store.SaveDaily(a.cfgMgr.Get().LogRetention); err != nil {
-		fmt.Println("warning: save stats:", err)
-	}
-	// Release the SQLite handle AFTER the final flush. Leaving it open
-	// holds a file lock on Windows, so a second app instance started
-	// while the first is still exiting can hit "database is locked"
-	// and silently fail to write — which manifests as "data wiped on
-	// restart".
+	// (6) Release the SQLite handle AFTER the final flush. Leaving it
+	// open holds a file lock on Windows, so a second app instance
+	// started while the first is still exiting can hit "database is
+	// locked" and silently fail to write — which manifests as "data
+	// wiped on restart".
 	a.store.Close()
+
+	// (7) Force-evict every cached upstream client so their idle
+	// TCP connections close before the process exits. Without this
+	// step, idle conns linger until the next reap tick (up to 1
+	// minute) and prevent the runtime from releasing socket fds
+	// promptly — visible as goroutine / fd growth in a long-running
+	// dev session.
+	upstream.ReapIdle(0)
 }
 
 // ---------------------------------------------------------------------
@@ -310,6 +383,25 @@ func (a *App) UpdateServerSettings(host string, port int) error {
 	cfg.ServerHost = host
 	cfg.ServerPort = port
 	return a.SaveConfig(cfg)
+}
+
+// SetLogRetention updates only the log retention window (in days),
+// without touching providers, aliases, client keys, or the proxy
+// bind address. The change is persisted via cfgMgr.Save — which
+// triggers the config:changed event so the Settings UI reloads — but
+// the proxy is intentionally NOT restarted (log retention only
+// influences the persistLogsLoop's purge tick, never an in-flight
+// request handler). The bound Settings UI calls this when the
+// logRetention input changes so providers / aliases / clientKeys
+// are not redundantly re-written to disk.
+func (a *App) SetLogRetention(n int) error {
+	cfg := a.cfgMgr.Get()
+	cfg.LogRetention = n
+	if err := a.cfgMgr.Save(cfg); err != nil {
+		return err
+	}
+	a.emitConfigChanged()
+	return nil
 }
 
 // GenerateClientKey returns a fresh, high-entropy API key the user can
@@ -912,6 +1004,8 @@ func (a *App) emitConfigChanged() {
 // polling. One ticker is shared between both signals; the 2-second
 // cadence is intentionally kept light.
 func (a *App) emitLogsLoop() {
+	a.loopWG.Add(1)
+	defer a.loopWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[loop] panic in emitLogsLoop: %v\n%s", r, debug.Stack())
@@ -922,6 +1016,8 @@ func (a *App) emitLogsLoop() {
 	for {
 		select {
 		case <-a.ctx.Done():
+			return
+		case <-a.doneCh:
 			return
 		case <-ticker.C:
 			a.emitLogsChanged()
@@ -938,7 +1034,15 @@ func (a *App) emitLogsLoop() {
 // cadence (down from 30s) bounds how much a forcibly-terminated
 // process can lose: with the Append-driven scheduleFlush() running in
 // parallel, the worst case window is a few seconds of trailing data.
+//
+// The loop listens on both <-a.ctx.Done() and <-a.doneCh so that
+// shutdown can force an exit without waiting on a tick; on either
+// signal it performs exactly one final flushPersisted() and returns,
+// so the shutdown path's own flushPersisted() never races a duplicate
+// ticker-driven flush on the same dirty-range markers.
 func (a *App) persistLogsLoop() {
+	a.loopWG.Add(1)
+	defer a.loopWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[loop] panic in persistLogsLoop: %v\n%s", r, debug.Stack())
@@ -946,13 +1050,13 @@ func (a *App) persistLogsLoop() {
 	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for {
+	done := false
+	for !done {
 		select {
 		case <-a.ctx.Done():
-			// Final flush so a non-graceful context cancellation still
-			// persists whatever accumulated since the last tick.
-			a.flushPersisted()
-			return
+			done = true
+		case <-a.doneCh:
+			done = true
 		case <-ticker.C:
 			cfg := a.cfgMgr.Get()
 			if cfg.LogRetention > 0 {
@@ -961,6 +1065,10 @@ func (a *App) persistLogsLoop() {
 			a.flushPersisted()
 		}
 	}
+	// Final flush on shutdown — exactly once. The shutdown main path
+	// also calls flushPersisted, but flushMu serializes the two so
+	// only one SaveLogs runs against the dirty range.
+	a.flushPersisted()
 }
 
 // scheduleFlush coalesces the burst of Appends that typically arrive
@@ -1018,6 +1126,8 @@ func (a *App) flushPersisted() {
 // idle for longer than upstreamReapIdle, so the global client cache in
 // internal/upstream does not grow without bound over time.
 func (a *App) reapClientsLoop() {
+	a.loopWG.Add(1)
+	defer a.loopWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[loop] panic in reapClientsLoop: %v\n%s", r, debug.Stack())
@@ -1028,6 +1138,8 @@ func (a *App) reapClientsLoop() {
 	for {
 		select {
 		case <-a.ctx.Done():
+			return
+		case <-a.doneCh:
 			return
 		case <-ticker.C:
 			upstream.ReapIdle(upstreamReapIdle)

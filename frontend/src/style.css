@@ -181,3 +181,111 @@ h1, h2, h3, h4 {
   from { transform: translateX(100%); }
   to   { transform: translateX(0); }
 }
+
+/* ------------------------------------------------------------------ */
+/* Global polish layer — glass panels, layered surface, entrance motion.
+ * Everything below stays on antd tokens so light/dark both work.       */
+/* ------------------------------------------------------------------ */
+
+/* Canvas — flat slate. Big-tech dashboards (Linear, Vercel, Supabase,
+ * Raycast, Stripe Dashboard) never use radial gradient backgrounds on
+ * the page itself; they let layered card shadows do the heavy lifting.
+ * The previous ambient violet wash made the app feel like a generic
+ * "AI dashboard template" instead of a focused dev tool. Keep the
+ * canvas as the single neutral slate tone from antd. */
+.api-distribution {
+  background: var(--ant-color-bg-layout);
+}
+
+/* Frosted-glass chrome (TopBar / Sidebar) — sits one subtle notch above
+ * the canvas. The lowered opacity keeps the slate canvas reading
+ * through; backdrop blur sharpens text on any colour the panels
+ * behind it might use. */
+.glass-surface {
+  background:
+    color-mix(in srgb, var(--ant-color-bg-elevated) 72%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  backdrop-filter: blur(20px) saturate(1.4);
+  border-color: color-mix(in srgb, var(--ant-color-border) 70%, transparent);
+}
+
+/* Default antd Card (variant="outlined") only gets a border — no
+ * elevation. Three-layer shadow stack gives every card a real sense of
+ * weight over the slate canvas (Linear's spacing idea: shadow is what
+ * does the lifting, not gradients. */
+.ant-card {
+  box-shadow:
+    0 1px 1px rgba(15, 23, 42, 0.04),
+    0 2px 4px rgba(15, 23, 42, 0.04),
+    0 8px 24px -6px rgba(15, 23, 42, 0.08);
+}
+.dark .ant-card {
+  box-shadow:
+    0 1px 1px rgba(0, 0, 0, 0.5),
+    0 2px 4px rgba(0, 0, 0, 0.45),
+    0 12px 28px -8px rgba(0, 0, 0, 0.55);
+}
+
+/* Card depth scale: quiet chutney for panels that sit above the page
+ * (Anti-GI: layered, not flat). Dark mode shadows go denser since the
+ * backdrop is much darker. */
+.card-depth-1 {
+  box-shadow:
+    0 1px 2px rgba(16, 24, 40, 0.04),
+    0 2px 8px rgba(16, 24, 40, 0.04);
+}
+.card-depth-2 {
+  box-shadow:
+    0 1px 2px rgba(16, 24, 40, 0.05),
+    0 6px 18px rgba(16, 24, 40, 0.08);
+}
+.card-depth-3 {
+  box-shadow:
+    0 2px 6px rgba(16, 24, 40, 0.06),
+    0 16px 40px rgba(16, 24, 40, 0.12);
+}
+.dark .card-depth-1 { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+.dark .card-depth-2 {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.dark .card-depth-3 {
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4), 0 20px 44px rgba(0, 0, 0, 0.45);
+}
+
+/* Hover lift — small translate + shadow deepening for tappable cards. */
+.lift-hover {
+  transition:
+    transform 0.18s ease,
+    box-shadow 0.24s ease,
+    border-color 0.18s ease;
+}
+.lift-hover:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    0 2px 4px rgba(16, 24, 40, 0.06),
+    0 12px 28px rgba(16, 24, 40, 0.10);
+}
+.dark .lift-hover:hover {
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4), 0 16px 36px rgba(0, 0, 0, 0.45);
+}
+
+/* Staggered entrance for dashboard cards / sections. Duration/format
+ * tuned so the wave feels intentional on load but never blocks. */
+@keyframes fadeInScale {
+  from { opacity: 0; transform: scale(0.985) translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.enter-wave { animation: fadeInScale 0.38s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Soft pulse for live-status dots spawned above the existing StatusDot. */
+@keyframes pulseSoft {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+.pulse-soft { animation: pulseSoft 2s ease-in-out infinite; }
+
+/* Round the body of headless cards so the inner panel's radius matches
+ * the card — antd leaves a headless card's body corners square, which
+ * looks unfinished on hero / chart surfaces that skip the header.
+ * Cards WITH a header keep their standard square body top. */
+.ant-card:not(:has(.ant-card-head)) .ant-card-body { border-radius: inherit; }

@@ -14,7 +14,7 @@ export function PageHeader({title, description, actions, className}: PageHeaderP
     <div
       className={cn(
         'flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between',
-        'pb-8 mb-8 border-b border-border',
+        'pb-7 mb-8 border-b border-border',
         className,
       )}
     >
@@ -26,7 +26,7 @@ export function PageHeader({title, description, actions, className}: PageHeaderP
           {title}
         </Typography.Title>
         {description && (
-          <Typography.Paragraph className="mt-0! mb-2! text-base text-fg-muted! max-w-3xl leading-relaxed!">
+          <Typography.Paragraph className="mt-0! mb-0! text-[13px] text-fg-muted! max-w-3xl leading-relaxed!">
             {description}
           </Typography.Paragraph>
         )}

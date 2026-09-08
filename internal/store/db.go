@@ -32,6 +32,11 @@ func openDB(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	st := &Store{db: db, days: make(map[string]*DailyAgg)}
+	// Pre-allocate the ring buffer at full capacity so Append does not
+	// trigger cap-grow allocations as the buffer fills up to
+	// MaxLogEntries (previously grown incrementally, retaining
+	// intermediate ~MiB-class backing arrays).
+	st.logs = make([]types.LogEntry, 0, MaxLogEntries)
 	if err := st.initSchema(); err != nil {
 		db.Close()
 		return nil, err
@@ -187,23 +192,38 @@ func (s *Store) importLogsJSON(path string) error {
 // a corrupted DailyAgg (e.g. a future unencodable field) would silently
 // overwrite the row with empty objects and lose data with no log.
 func (s *Store) upsertDaily(d *DailyAgg) error {
-	byModel, err := json.Marshal(d.ByModel)
-	if err != nil {
+	// The four per-day maps are encoded into the package-level
+	// upsertDailyBuf (Reset + json.NewEncoder.Encode per map), so
+	// we don't allocate a fresh ~MB-class []byte for each column.
+	// The string() conversions below copy the bytes so subsequent
+	// Resets are safe.
+	enc := json.NewEncoder(&upsertDailyBuf)
+
+	upsertDailyBuf.Reset()
+	if err := enc.Encode(d.ByModel); err != nil {
 		return fmt.Errorf("marshal by_model for %s: %w", d.Date, err)
 	}
-	byProvider, err := json.Marshal(d.ByProvider)
-	if err != nil {
+	byModel := string(upsertDailyBuf.Bytes())
+
+	upsertDailyBuf.Reset()
+	if err := enc.Encode(d.ByProvider); err != nil {
 		return fmt.Errorf("marshal by_provider for %s: %w", d.Date, err)
 	}
-	byClientKey, err := json.Marshal(d.ByClientKey)
-	if err != nil {
+	byProvider := string(upsertDailyBuf.Bytes())
+
+	upsertDailyBuf.Reset()
+	if err := enc.Encode(d.ByClientKey); err != nil {
 		return fmt.Errorf("marshal by_client_key for %s: %w", d.Date, err)
 	}
-	byHour, err := json.Marshal(d.ByHour)
-	if err != nil {
+	byClientKey := string(upsertDailyBuf.Bytes())
+
+	upsertDailyBuf.Reset()
+	if err := enc.Encode(d.ByHour); err != nil {
 		return fmt.Errorf("marshal by_hour for %s: %w", d.Date, err)
 	}
-	_, err = s.db.Exec(`
+	byHour := string(upsertDailyBuf.Bytes())
+
+	_, err := s.db.Exec(`
 		INSERT INTO daily_stats
 			(date, requests, input_tokens, output_tokens, errors, latency_sum, by_model, by_provider, by_client_key, by_hour)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -219,7 +239,7 @@ func (s *Store) upsertDaily(d *DailyAgg) error {
 			by_hour = excluded.by_hour`,
 		d.Date, d.TotalRequests, d.TotalInputTokens, d.TotalOutputTokens,
 		d.Errors, d.LatencySumMs,
-		string(byModel), string(byProvider), string(byClientKey), string(byHour))
+		byModel, byProvider, byClientKey, byHour)
 	if err != nil {
 		return fmt.Errorf("upsert daily %s: %w", d.Date, err)
 	}

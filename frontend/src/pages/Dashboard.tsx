@@ -52,6 +52,7 @@ import { toast } from '@/store/toast'
 import { formatNumber } from '@/lib/format'
 import { copyToClipboard } from '@/lib/clipboard'
 import { useT } from '@/i18n/useT'
+import { useLocaleStore } from '@/store/locale'
 import type { HourBucket } from '@/types'
 
 interface QuickStartStep {
@@ -59,6 +60,15 @@ interface QuickStartStep {
   to?: string
   label: string
 }
+
+// Module-level empty object used as a stable fallback for
+// `ModelTrendChartContainer.data` whenever the backend has not
+// returned `requestsByHourByModel` yet. Without this constant a fresh
+// `{}` is allocated on every render, which flips `data`'s reference
+// and triggers a full rebuild of the trend chart's
+// `rows` / `rowsByHour` memos — exactly the heartbeat allocation
+// churn the F-004 fix is meant to prevent.
+const EMPTY_HOUR_MAP = Object.freeze({}) as Record<string, HourBucket[]>
 
 export function Dashboard() {
   const stats = useConfigStore((s) => s.stats)
@@ -70,7 +80,8 @@ export function Dashboard() {
   const startServer = useConfigStore((s) => s.startServer)
   const stopServer = useConfigStore((s) => s.stopServer)
   const restartServer = useConfigStore((s) => s.restartServer)
-  const statsError = useConfigStore((s) => s.refreshErrors.stats)
+  const statsError = useConfigStore((s) => s.refreshErrorStats)
+  const locale = useLocaleStore((s) => s.locale)
   const t = useT()
 
   // Subscribe to backend stats:changed events emitted every ~2s.
@@ -117,15 +128,30 @@ export function Dashboard() {
     return new Map(providers.map((p) => [p.id, p]))
   }, [providers])
 
+  // byClientKey is a plain object from the backend; without memoizing
+  // the sort, every 2s heartbeat allocates a fresh `Object.entries(...)`
+  // array and forces the by-client-key list to re-render even when the
+  // totals haven't changed. Keyed only on the source map so the list
+  // re-sorts only when the underlying data actually moves.
+  const sortedClientKeys = useMemo(
+    () =>
+      Object.entries(stats?.requestsByClientKey ?? {}).sort(
+        ([, a], [, b]) => b - a,
+      ),
+    [stats?.requestsByClientKey],
+  )
+
   // Use the i18n catalog when the key exists, otherwise fall back to the
   // hard-coded English message so we don't depend on locale changes for
-  // a single error-string.
+  // a single error-string. `t` is a stable reference (see `useT`), so we
+  // don't need to list it as a dep — only the active locale affects
+  // the resolved string.
   const statsStaleMessage = useMemo(() => {
     const translated = t('dashboard.stats.stale')
     return translated === 'dashboard.stats.stale'
       ? 'Statistics may be out of date'
       : translated
-  }, [t])
+  }, [locale])
 
   const quickStart = useMemo<QuickStartStep[]>(() => {
     const steps: QuickStartStep[] = []
@@ -139,7 +165,10 @@ export function Dashboard() {
       steps.push({ key: 'start', label: t('dashboard.quickStart.start') })
     }
     return steps
-  }, [providers.length, modelAliases.length, serverStatus?.running, t])
+    // `t` is a stable reference (useCallback with `[]` deps inside
+    // useT) so we don't list it here; the memo only needs to
+    // re-derive when the data driving the steps actually changes.
+  }, [providers.length, modelAliases.length, serverStatus?.running])
 
   async function handleStart() {
     try {
@@ -179,7 +208,9 @@ export function Dashboard() {
         description={t('pages.desc.dashboard')}
       />
 
-      {/* Stat row */}
+      {/* Stat row — each KPI is a layered surface with a quiet depth
+       * shadow and a tiny accent edge. The staggered entrance makes
+       * the four cards arrive as a wave instead of a flat grid. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
         {isInitial ? (
           <>
@@ -190,40 +221,67 @@ export function Dashboard() {
           </>
         ) : (
           <>
-            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
+            <Card
+              variant="outlined"
+              className="card-depth-1 enter-wave lift-hover"
+              styles={{ body: { padding: '24px' } }}
+              style={{animationDelay: '0ms'}}
+            >
               <Statistic
                 title={t('dashboard.allTimeConsumption')}
                 value={formatNumber(allTimeTokens)}
+                valueStyle={{fontSize: 28, fontWeight: 600}}
                 prefix={<LuZap className="size-4 text-accent" aria-hidden />}
+                suffix={t('dashboard.tokensUnit')}
               />
               <TokenBreakdown
                 input={allTime?.inputTokens ?? 0}
                 output={allTime?.outputTokens ?? 0}
-                t={t}
+                unit={t('dashboard.tokensUnit')}
               />
             </Card>
-            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
+            <Card
+              variant="outlined"
+              className="card-depth-1 enter-wave lift-hover"
+              styles={{ body: { padding: '24px' } }}
+              style={{animationDelay: '40ms'}}
+            >
               <Statistic
                 title={t('dashboard.weekConsumption')}
                 value={formatNumber(weekTokens)}
+                valueStyle={{fontSize: 28, fontWeight: 600}}
                 prefix={<LuCalendarDays className="size-4 text-accent" aria-hidden />}
+                suffix={t('dashboard.tokensUnit')}
               />
               <DeltaLine prev={prevWeekTokens} prevLabel={t('dashboard.prevWeek')} percent={weekDelta} />
-              <TokenBreakdown input={week?.inputTokens ?? 0} output={week?.outputTokens ?? 0} t={t} />
+              <TokenBreakdown input={week?.inputTokens ?? 0} output={week?.outputTokens ?? 0} unit={t('dashboard.tokensUnit')} />
             </Card>
-            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
+            <Card
+              variant="outlined"
+              className="card-depth-1 enter-wave lift-hover"
+              styles={{ body: { padding: '24px' } }}
+              style={{animationDelay: '80ms'}}
+            >
               <Statistic
                 title={t('dashboard.monthConsumption')}
                 value={formatNumber(monthTokens)}
-                prefix={<LuCalendarRange className="size-4 text-success" aria-hidden />}
+                valueStyle={{fontSize: 28, fontWeight: 600}}
+                prefix={<LuCalendarRange className="size-4 text-accent" aria-hidden />}
+                suffix={t('dashboard.tokensUnit')}
               />
               <DeltaLine prev={prevMonthTokens} prevLabel={t('dashboard.prevMonth')} percent={monthDelta} />
-              <TokenBreakdown input={month?.inputTokens ?? 0} output={month?.outputTokens ?? 0} t={t} />
+              <TokenBreakdown input={month?.inputTokens ?? 0} output={month?.outputTokens ?? 0} unit={t('dashboard.tokensUnit')} />
             </Card>
-            <Card variant="outlined" styles={{ body: { padding: '24px' } }}>
+            <Card
+              variant="outlined"
+              className="card-depth-1 enter-wave lift-hover"
+              styles={{ body: { padding: '24px' } }}
+              style={{animationDelay: '120ms'}}
+            >
               <Statistic
                 title={t('dashboard.weekErrorRate')}
                 value={weekErrorRate === 0 ? '0%' : `${weekErrorRate.toFixed(1)}%`}
+                valueStyle={{fontSize: 28, fontWeight: 600}}
                 prefix={<LuTriangleAlert
                   className={`size-4 ${weekErrorRate > 5 ? 'text-danger' : weekErrorRate > 1 ? 'text-warning' : 'text-fg-subtle'}`}
                   aria-hidden
@@ -243,9 +301,12 @@ export function Dashboard() {
 
       {/* Quick start */}
       {quickStart.length > 0 && (
-        <Card variant="outlined" className="border-accent/30 bg-accent-soft/40">
+        <Card
+          variant="outlined"
+          className="card-depth-2 enter-wave"
+        >
           <div className="flex items-center gap-2">
-            <LuSparkles className="size-4 text-accent" aria-hidden />
+            <LuSparkles className="size-4 text-fg-muted" aria-hidden />
             <div className="text-base font-semibold text-fg">{t('dashboard.quickStart.title')}</div>
           </div>
           <Typography.Text type="secondary" className="block mt-3">
@@ -255,9 +316,9 @@ export function Dashboard() {
             {quickStart.map((step, idx) => (
               <li
                 key={step.key}
-                className="flex items-center gap-3 rounded-lg border border-border bg-bg-elevated px-4 py-3"
+                className="flex items-center gap-3 rounded-lg border border-border bg-bg-subtle/40 px-4 py-3"
               >
-                <span className="inline-flex size-7 items-center justify-center rounded-full bg-accent text-fg-on-accent text-xs font-semibold shrink-0">
+                <span className="inline-flex size-7 items-center justify-center rounded-full bg-bg-elevated border border-border text-fg-muted text-xs font-semibold shrink-0">
                   {idx + 1}
                 </span>
                 <span className="flex-1 text-sm text-fg">{step.label}</span>
@@ -293,7 +354,7 @@ export function Dashboard() {
         <Card
           title={
             <div className="flex items-center gap-2.5">
-              <span className="inline-flex size-7 items-center justify-center rounded-md bg-accent-soft text-accent">
+              <span className="inline-flex size-7 items-center justify-center rounded-md bg-bg-subtle text-fg-muted border border-border">
                 <LuServer className="size-4" aria-hidden />
               </span>
               <span className="text-base font-semibold">{t('dashboard.serverStatus')}</span>
@@ -307,7 +368,8 @@ export function Dashboard() {
             </div>
           }
           variant="outlined"
-          className="lg:col-span-1"
+          className="lg:col-span-1 card-depth-2 enter-wave"
+          style={{animationDelay: '160ms'}}
         >
           {/* Hero status block: large pulsing dot + status word. */}
           <div className="flex items-center gap-3 rounded-lg border border-border bg-bg-subtle/40 px-4 py-3.5">
@@ -316,10 +378,7 @@ export function Dashboard() {
               <span className="text-xs uppercase tracking-wider text-fg-muted">
                 {t('dashboard.serverStatus')}
               </span>
-              <span
-                className={`mt-0.5 text-base font-semibold ${running ? 'text-success' : 'text-fg-muted'
-                  }`}
-              >
+              <span className="mt-0.5 text-base font-semibold text-fg">
                 {running ? t('dashboard.running') : t('dashboard.stopped')}
               </span>
             </div>
@@ -433,7 +492,7 @@ export function Dashboard() {
         <Card
           title={
             <div className="flex items-center gap-2.5">
-              <span className="inline-flex size-7 items-center justify-center rounded-md bg-accent-soft text-accent">
+              <span className="inline-flex size-7 items-center justify-center rounded-md bg-bg-subtle text-fg-muted border border-border">
                 <LuKeyRound className="size-4" aria-hidden />
               </span>
               <span className="text-base font-semibold">
@@ -442,6 +501,8 @@ export function Dashboard() {
             </div>
           }
           variant="outlined"
+          className="card-depth-1 enter-wave"
+          style={{animationDelay: '200ms'}}
         >
           {Object.keys(stats?.requestsByClientKey ?? {}).length === 0 ? (
             <EmptyState
@@ -451,9 +512,7 @@ export function Dashboard() {
             />
           ) : (
             <ul className="space-y-2">
-            {Object.entries(stats?.requestsByClientKey ?? {})
-              .sort(([, a], [, b]) => b - a)
-              .map(([label, count], idx) => {
+            {sortedClientKeys.map(([label, count], idx) => {
                 const recent = stats?.requestsByClientKeyRecent?.[label] ?? 0
                 // Activity status derived from the relationship
                 // between lifetime total and the 24h subset:
@@ -486,7 +545,7 @@ export function Dashboard() {
                     key={label}
                     className={`flex items-center gap-3 rounded-lg border px-3.5 py-3 transition-colors ${
                       isTop
-                        ? 'border-accent/40 bg-accent-soft/40'
+                        ? 'border-border-strong bg-bg-subtle/60'
                         : 'border-border bg-bg-subtle/30'
                     }`}
                   >
@@ -494,8 +553,8 @@ export function Dashboard() {
                     <span
                       className={`inline-flex size-8 shrink-0 items-center justify-center rounded-md text-xs font-semibold ${
                         isTop
-                          ? 'bg-accent text-fg-on-accent'
-                          : 'bg-bg-elevated text-fg-muted'
+                          ? 'bg-fg text-bg'
+                          : 'bg-bg-elevated text-fg-muted border border-border'
                       }`}
                     >
                       #{idx + 1}
@@ -514,7 +573,7 @@ export function Dashboard() {
                     <div className="text-right">
                       <div
                         className={`text-lg font-semibold tabular-nums leading-tight ${
-                          isTop ? 'text-accent' : 'text-fg'
+                          isTop ? 'text-fg' : 'text-fg-muted'
                         }`}
                       >
                         {formatNumber(count)}
@@ -539,7 +598,7 @@ export function Dashboard() {
         <Card
           title={
             <div className="flex items-center gap-2.5">
-              <span className="inline-flex size-7 items-center justify-center rounded-md bg-accent-soft text-accent">
+              <span className="inline-flex size-7 items-center justify-center rounded-md bg-bg-subtle text-fg-muted border border-border">
                 <LuBox className="size-4" aria-hidden />
               </span>
               <span className="text-base font-semibold">
@@ -549,6 +608,8 @@ export function Dashboard() {
             </div>
           }
           variant="outlined"
+          className="card-depth-1 enter-wave"
+          style={{animationDelay: '240ms'}}
         >
           {enabledAliases.length === 0 ? (
             <EmptyState
@@ -654,8 +715,15 @@ function ModelTrendChartContainer() {
   // roster froze the chart at its first frame. Depending on `byModel`
   // keeps the trend live while still avoiding needless re-renders when
   // the heartbeat doesn't change the stats reference.
+  //
+  // The fallback uses the module-level `EMPTY_HOUR_MAP` instead of a
+  // fresh inline `{}` so the reference stays stable across renders
+  // — a new `{}` each time would flip `data`'s identity and force the
+  // downstream chart to re-run its `rows` useMemo on every heartbeat,
+  // re-allocating ~720 `TrendRow`s even when `byModel` is briefly
+  // `undefined` (e.g. a transient stats fetch error).
   const data = useMemo(
-    () => (byModel ?? ({} as Record<string, HourBucket[]>)),
+    () => byModel ?? EMPTY_HOUR_MAP,
     [byModel],
   )
 
@@ -748,7 +816,9 @@ function ModelTrendChartContainer() {
  * DeltaLine renders the "vs previous period" comparison under a KPI
  * value: an up/down arrow with the percent change (green up / red down)
  * plus the previous period's absolute value. When there is no baseline
- * the percent is omitted and only the previous value is shown.
+ * the percent is omitted and only the previous value is shown. Both
+ * call sites pass token counts, so the previous-period value carries
+ * the token unit too — a bare number would read as ambiguous.
  */
 function DeltaLine({
   prev,
@@ -759,6 +829,7 @@ function DeltaLine({
   prevLabel: string
   percent: number | null
 }) {
+  const t = useT()
   return (
     <Typography.Text type="secondary" className="mt-2! block text-xs">
       {percent !== null ? (
@@ -774,28 +845,30 @@ function DeltaLine({
         <span className="text-fg-muted">—</span>
       )}
       <span className="mx-1">·</span>
-      {prevLabel}: {formatNumber(prev)}
+      {prevLabel}: {formatNumber(prev)} {t('dashboard.tokensUnit')}
     </Typography.Text>
   )
 }
 
 /**
  * TokenBreakdown renders the input / output token split under a
- * consumption KPI value.
+ * consumption KPI value, each with the shared token unit suffix so
+ * the numbers never read as ambiguous raw counts.
  */
 function TokenBreakdown({
   input,
   output,
-  t,
+  unit,
 }: {
   input: number
   output: number
-  t: (key: string) => string
+  unit: string
 }) {
+  const t = useT()
   return (
     <Typography.Text type="secondary" className="mt-1! block text-xs">
-      {t('dashboard.inputShort')} {formatNumber(input)} · {t('dashboard.outputShort')}{' '}
-      {formatNumber(output)}
+      {t('dashboard.inputShort')} {formatNumber(input)} {unit} · {t('dashboard.outputShort')}{' '}
+      {formatNumber(output)} {unit}
     </Typography.Text>
   )
 }

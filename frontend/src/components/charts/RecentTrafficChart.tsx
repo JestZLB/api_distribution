@@ -5,6 +5,7 @@ import {LuZap} from 'react-icons/lu'
 import {ChartCard} from '@/components/charts/ChartCard'
 import {ChartEmpty} from '@/components/charts/ChartEmpty'
 import {formatNumber} from '@/lib/format'
+import {useDesignTokens} from '@/lib/useDesignTokens'
 import {useT} from '@/i18n/useT'
 import type {HourBucket} from '@/types'
 
@@ -30,21 +31,6 @@ interface RecentTrafficChartProps {
   className?: string
 }
 
-/** antd `--ant-*` tokens are declared on the ConfigProvider root, not
- * `:root`. Reading them here at render time lets the chart's axis / grid
- * pick up the current light or dark theme so it never mismatches.
- *
- * IMPORTANT: G2 v5 paints into a `<canvas>`, so CSS-var values
- * (`var(--color-...)`) on the color range are NOT resolved by the
- * canvas context — canvas only takes literal hex/rgb. We therefore
- * resolve the tokens to concrete strings here and pass them down. */
-function readToken(name: string, fallback: string): string {
-  const root = document.querySelector('.api-distribution') as HTMLElement | null
-  if (!root) return fallback
-  const v = getComputedStyle(root).getPropertyValue(name).trim()
-  return v || fallback
-}
-
 /**
  * RecentTrafficChart renders the "近期流量" stacked column chart.
  *
@@ -60,18 +46,12 @@ export function RecentTrafficChart({
 }: RecentTrafficChartProps): JSX.Element {
   const t = useT()
 
-  // Resolve all canvas colors and axis/grid tokens ONCE per mount.
-  // Without this memoization the chart would call getComputedStyle
-  // four times every heartbeat and force a full re-paint.
-  const themeTokens = useMemo(
-    () => ({
-      successHex: readToken('--ant-color-success', '#52c41a'),
-      errorHex: readToken('--ant-color-error', '#ff4d4f'),
-      axis: readToken('--ant-color-text-tertiary', 'rgba(0, 0, 0, 0.35)'),
-      grid: readToken('--ant-color-fill-secondary', 'rgba(0, 0, 0, 0.06)'),
-    }),
-    [],
-  )
+  // Resolve all canvas colors and axis/grid tokens via the shared
+  // useDesignTokens hook. The hook subscribes to `useThemeStore.theme`
+  // (and to `prefers-color-scheme` when the theme is `system`) so the
+  // KPI strip + stacked-column repaint correctly on a Settings theme
+  // switch, instead of holding onto a stale palette from mount time.
+  const themeTokens = useDesignTokens()
 
   // Translate the success/error labels once; the rows are emitted in
   // both languages (we keep them distinct strings inside each row so
@@ -278,7 +258,7 @@ const tooltipConfig = useMemo(
         <MetricCell
           label={t('dashboard.peak24h')}
           value={summary.peak > 0 ? `${formatNumber(summary.peak)}` : '—'}
-          sub={summary.peak > 0 ? `at ${summary.peakHour}` : undefined}
+          sub={summary.peak > 0 ? t('dashboard.peakAt', {time: summary.peakHour}) : undefined}
           accent="var(--ant-color-primary)"
         />
       </div>
@@ -377,7 +357,7 @@ function MetricCell({
     // removed once BorderBeam shipped — the beam now owns the
     // colour-coded edge.
     <BorderBeam duration={6} lineWidth={2} size={80} color={accent}>
-      <div className="relative rounded-md border border-border bg-bg-subtle/40 px-3 py-2.5 overflow-hidden">
+      <div className="relative rounded-md border border-border bg-bg-subtle/40 px-3 py-2.5 overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
         <div className="text-[11px] font-medium uppercase tracking-wider text-fg-muted">
           {label}
         </div>

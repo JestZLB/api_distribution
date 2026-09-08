@@ -13,22 +13,69 @@ interface Props {
 
 interface State {
   hasError: boolean
-  error: Error | null
+  // Only the (truncated) `message` is retained in component state.
+  // The full `error.stack` is captured into `lastCrashRef` (below)
+  // for telemetry / debugging, so the React tree can drop the
+  // original `Error` reference as soon as `componentDidCatch` runs
+  // and the GC can reclaim the stack frames on the next idle cycle.
+  message: string
 }
+
+// Module-level crash slot. The boundary writes the full stack here
+// during `componentDidCatch` and exposes it via `getLastCrash()` so
+// a future telemetry hook (Sentry / Datadog / OTel) can ship it
+// without each consumer having to wrap the class component. The
+// next crash overwrites the previous entry, so the slot holds at
+// most one stack — typically freed as soon as the boundary
+// re-renders or the page unloads.
+let lastCrashRef: {stack: string; componentStack: string; ts: number} | null = null
+
+/** Read the most recent error captured by `<ErrorBoundary />`.
+ * Returns `null` if no crash has been recorded since module load. */
+export function getLastCrash(): {stack: string; componentStack: string; ts: number} | null {
+  return lastCrashRef
+}
+
+const MAX_MESSAGE_LEN = 1024
 
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props)
-    this.state = {hasError: false, error: null}
+    this.state = {hasError: false, message: ''}
   }
 
   static getDerivedStateFromError(error: Error): State {
-    return {hasError: true, error}
+    // Capture only the truncated message so `state` does not pin the
+    // full `Error` (and its `stack` / captured-frame chain) in
+    // memory for the lifetime of the error UI. The full stack is
+    // recorded separately in `componentDidCatch` below.
+    const message =
+      typeof error?.message === 'string'
+        ? error.message.slice(0, MAX_MESSAGE_LEN)
+        : ''
+    return {hasError: true, message}
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    // Log to console for development debugging; a production
-    // telemetry endpoint could be added here in the future.
+    // Capture the full stack + component trace here (where they
+    // cannot leak into React state). Wrapped in try/catch so a
+    // pathological `error.stack` getter that itself throws cannot
+    // take the boundary down — losing one telemetry entry is
+    // strictly better than letting the boundary crash.
+    try {
+      const stack = typeof error?.stack === 'string' ? error.stack : ''
+      lastCrashRef = {
+        stack,
+        componentStack: errorInfo?.componentStack ?? '',
+        ts: Date.now(),
+      }
+    } catch {
+      // Defensive: never let a telemetry failure unmount the tree.
+    }
+
+    // Local-only logging for development debugging; a production
+    // telemetry endpoint could replace this in the future.
+    // eslint-disable-next-line no-console
     console.error('[ErrorBoundary]', error, errorInfo)
     messageApiRef.current?.error('Render error')
   }
@@ -42,7 +89,6 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     if (!this.state.hasError) return this.props.children
 
-    const {error} = this.state
     // Read locale from store (outside React hooks) for class component.
     const locale = useLocaleStore.getState().locale
     const t = (key: string) =>
@@ -63,10 +109,10 @@ export class ErrorBoundary extends Component<Props, State> {
             <Typography.Paragraph className="mt-0! text-sm text-fg-muted!">
               {t('error.description')}
             </Typography.Paragraph>
-            {error?.message && (
+            {this.state.message && (
               <div className="rounded-md bg-bg-subtle border border-border px-3 py-2">
                 <p className="text-xs font-mono text-fg-muted! break-all!">
-                  {error.message}
+                  {this.state.message}
                 </p>
               </div>
             )}

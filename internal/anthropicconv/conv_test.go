@@ -69,15 +69,17 @@ func TestBuildRequest_DefaultsAndFallbacks(t *testing.T) {
 		t.Errorf("stream flag = %v", got["stream"])
 	}
 
-	// Default max_tokens when neither field is set.
+	// Default max_tokens when neither field is set: a large safe value
+	// so a client that omits the field never gets its output hard-cropped
+	// to a tiny default.
 	in2 := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
 	out, err = BuildRequest(in2, false)
 	if err != nil {
 		t.Fatalf("BuildRequest: %v", err)
 	}
 	_ = json.Unmarshal(out, &got)
-	if got["max_tokens"].(float64) != 1024 {
-		t.Errorf("default max_tokens = %v", got["max_tokens"])
+	if got["max_tokens"].(float64) != 8192 {
+		t.Errorf("default max_tokens = %v, want 8192", got["max_tokens"])
 	}
 }
 
@@ -111,6 +113,153 @@ func TestBuildRequest_StopAndContentArray(t *testing.T) {
 	}
 	if seqs[0] != "END" || seqs[1] != "STOP" {
 		t.Errorf("stop_sequences = %v", seqs)
+	}
+}
+
+func TestBuildRequest_PreservesImagesAndToolBlocks(t *testing.T) {
+	in := []byte(`{
+		"model": "claude-3-5-sonnet-latest",
+		"messages": [
+			{"role":"user","content":[
+				{"type":"text","text":"What is in this image?"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+			]}
+		],
+		"max_tokens": 100
+	}`)
+	out, err := BuildRequest(in, false)
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	m := msgs[0].(map[string]any)
+	blocks, ok := m["content"].([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("expected 2 content blocks, got %v", m["content"])
+	}
+	textBlk := blocks[0].(map[string]any)
+	imgBlk := blocks[1].(map[string]any)
+	if textBlk["type"] != "text" {
+		t.Errorf("block[0].type = %v", textBlk["type"])
+	}
+	if imgBlk["type"] != "image" {
+		t.Errorf("block[1].type = %v (image dropped!)", imgBlk["type"])
+	}
+	src := imgBlk["source"].(map[string]any)
+	if src["media_type"] != "image/png" || src["data"] != "AAAA" {
+		t.Errorf("image source = %v", src)
+	}
+}
+
+func TestBuildRequest_PreservesToolRoleAndToolCalls(t *testing.T) {
+	in := []byte(`{
+		"model": "claude-3-5-sonnet-latest",
+		"messages": [
+			{"role":"assistant","content":"Let me check.","tool_calls":[
+				{"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":\"foo\"}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_1","content":"result text"}
+		],
+		"max_tokens": 100
+	}`)
+	out, err := BuildRequest(in, false)
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+
+	// assistant: text + tool_use block
+	asst := msgs[0].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Errorf("msg[0].role = %v", asst["role"])
+	}
+	asstContent, ok := asst["content"].([]any)
+	if !ok || len(asstContent) != 2 {
+		t.Fatalf("assistant content should be 2 blocks, got %v", asst["content"])
+	}
+	toolUse := asstContent[1].(map[string]any)
+	if toolUse["type"] != "tool_use" {
+		t.Errorf("block[1].type = %v (tool_use dropped!)", toolUse["type"])
+	}
+	if toolUse["name"] != "search" {
+		t.Errorf("tool_use.name = %v", toolUse["name"])
+	}
+	input := toolUse["input"].(map[string]any)
+	if input["q"] != "foo" {
+		t.Errorf("tool_use.input = %v", input)
+	}
+
+	// tool role -> user message with tool_result block
+	toolMsg := msgs[1].(map[string]any)
+	if toolMsg["role"] != "user" {
+		t.Errorf("msg[1].role = %v (tool role dropped!)", toolMsg["role"])
+	}
+	tr := toolMsg["content"].([]any)[0].(map[string]any)
+	if tr["type"] != "tool_result" {
+		t.Errorf("tool_result block type = %v", tr["type"])
+	}
+	if tr["tool_use_id"] != "call_1" {
+		t.Errorf("tool_use_id = %v", tr["tool_use_id"])
+	}
+	if tr["content"] != "result text" {
+		t.Errorf("tool_result content = %v", tr["content"])
+	}
+}
+
+func TestBuildRequest_PassesThroughTopLevelParams(t *testing.T) {
+	in := []byte(`{
+		"model": "claude-3-5-sonnet-latest",
+		"messages": [{"role":"user","content":"hi"}],
+		"max_tokens": 100,
+		"tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+		"response_format": {"type":"json_object"},
+		"user": "client-1"
+	}`)
+	out, err := BuildRequest(in, false)
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if _, ok := got["tools"]; !ok {
+		t.Errorf("tools top-level param was dropped")
+	}
+	if _, ok := got["response_format"]; !ok {
+		t.Errorf("response_format top-level param was dropped")
+	}
+	if got["user"] != "client-1" {
+		t.Errorf("user top-level param was dropped: %v", got["user"])
+	}
+}
+
+func TestBuildRequest_DropsGatewayInjectedStreamOptions(t *testing.T) {
+	in := []byte(`{
+		"model": "claude-3-5-sonnet-latest",
+		"messages": [{"role":"user","content":"hi"}],
+		"max_tokens": 100,
+		"stream_options": {"include_usage": true}
+	}`)
+	out, err := BuildRequest(in, true)
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(out, &got)
+	if _, ok := got["stream_options"]; ok {
+		t.Errorf("stream_options should not be forwarded to Anthropic: %v", got["stream_options"])
 	}
 }
 

@@ -22,7 +22,7 @@ import {ClientKeysCard} from '@/components/settings/ClientKeysCard'
 import {useConfigStore} from '@/store/config'
 import {useSystemStore} from '@/store/system'
 import {useThemeStore, type Theme} from '@/store/theme'
-import {maskKey, redactKey} from '@/lib/format'
+import {maskKey, redactKeyForExport} from '@/lib/format'
 import {copyToClipboard} from '@/lib/clipboard'
 import {useT} from '@/i18n/useT'
 
@@ -130,9 +130,18 @@ export function Settings() {
     try {
       // Save server settings (host/port).
       await updateServerSettings(hostValue, portValue)
-      // If logRetention changed, persist it via full config save.
+      // Persist logRetention via the dedicated App.SetLogRetention
+      // binding so providers / aliases / clientKeys are NOT
+      // redundantly re-written to disk, and the proxy is not
+      // restarted (log retention only affects the persistLogsLoop's
+      // purge tick, never an in-flight handler).
       if (logRetention !== config.logRetention) {
-        await saveConfig({...config, logRetention})
+        await App.SetLogRetention(logRetention)
+        useConfigStore.setState((state) => ({
+          config: state.config
+            ? {...state.config, logRetention}
+            : state.config,
+        }))
       }
       if (!mountedRef.current) return
       message.success(t('toast.settingsSaved'))
@@ -142,35 +151,53 @@ export function Settings() {
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [config, hostValue, portValue, logRetention, updateServerSettings, saveConfig, t, message])
+  }, [config, hostValue, portValue, logRetention, updateServerSettings, t, message])
 
   const handleExportConfig = useCallback(async () => {
+    // Holds the most-recent export Blob so a follow-up cleanup
+    // pass (or a future "Cancel export" button) can drop the
+    // backing buffer. Without an explicit reference the Blob
+    // outlives the click handler because the URL → Blob association
+    // is kept alive by the browser's object URL table.
+    const blobRef = {current: null as Blob | null}
     try {
       const cfg = await App.GetConfig()
-      // Fully redact sensitive fields before export so the JSON
-      // never contains any recoverable secret bytes — unlike maskKey
-      // which keeps a small visible window for in-app UI display.
+      // Use the fixed-width `redactKeyForExport` placeholder instead
+      // of `redactKey` (which pads with `*` to match the key length).
+      // Long provider / client keys balloon the exported JSON for no
+      // benefit — the receiver already knows the field was scrubbed.
       const masked = {
         ...cfg,
         clientKeys: cfg.clientKeys.map((ck) => ({
           ...ck,
-          key: ck.key ? redactKey(ck.key) : '',
+          key: redactKeyForExport(ck.key),
         })),
         providers: cfg.providers.map((p) => ({
           ...p,
-          apiKey: p.apiKey ? redactKey(p.apiKey) : '',
+          apiKey: redactKeyForExport(p.apiKey),
         })),
       }
       const json = JSON.stringify(masked, null, 2)
       const blob = new Blob([json], {type: 'application/json'})
+      blobRef.current = blob
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
       a.download = 'api-distribution-config.json'
       a.click()
-      URL.revokeObjectURL(url)
+      // Defer revoke + blob drop one macrotask so the synchronous
+      // `click()` above has finished dispatching the download. The
+      // browser holds the URL → Blob association until we call
+      // `revokeObjectURL`, so this is what actually frees the
+      // backing buffer — without it the export Blob stays alive
+      // for the lifetime of the document.
+      setTimeout(() => {
+        URL.revokeObjectURL(url)
+        blobRef.current = null
+      }, 0)
       message.success(t('toast.configExported'))
     } catch (e) {
+      blobRef.current = null
       message.error(`${t('toast.configExportFailed')}: ${String(e)}`)
     }
   }, [t, message])

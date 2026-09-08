@@ -6,7 +6,13 @@
 // non-Windows builds).
 package system
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+)
 
 // ErrUnsupported is returned by platform stubs on non-Windows
 // builds so the frontend can surface a friendly message instead of
@@ -32,4 +38,52 @@ type AutoStart interface {
 // best-effort and surface ErrUnsupported to the user.
 func NewAutoStart() AutoStart {
 	return newPlatformAutoStart()
+}
+
+// cachedExePath + cachedExePathOnce hold the process-lifetime result
+// of os.Executable(), wrapped in registry-safe double quotes. os.Executable
+// reads /proc/self/exe on Linux/macOS and the per-process executable
+// path on Windows; it is stable for the lifetime of the process, so
+// every toggle of the AutoStart switch re-uses the cached value
+// instead of re-querying the OS.
+//
+// G-019: previously quotedExePath() called os.Executable on every
+// invocation. With Settings able to call SetAutoStart repeatedly,
+// that was needless syscall + allocation overhead. Now we resolve
+// the path ONCE per process via sync.Once.
+var (
+	cachedExePath     string
+	cachedExePathOnce sync.Once
+)
+
+// quotedExePath returns the current executable path wrapped in
+// double quotes so paths with spaces survive registry parsing.
+// The lookup is process-lifetime cached (see cachedExePath /
+// cachedExePathOnce) — every caller after the first gets the
+// pre-resolved string with zero syscalls.
+func quotedExePath() (string, error) {
+	cachedExePathOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			cachedExePath = ""
+			return
+		}
+		cachedExePath = `"` + strings.ReplaceAll(exe, `"`, `\"`) + `"`
+	})
+	if cachedExePath == "" {
+		// We can distinguish a real os.Executable failure from a
+		// successful empty lookup by checking the cached value:
+		// successful lookups always yield a quoted, non-empty string.
+		return "", fmt.Errorf("locate executable: os.Executable failed at first call")
+	}
+	return cachedExePath, nil
+}
+
+// resetExePathForTest clears the cached executable path so the next
+// call to quotedExePath re-resolves it via os.Executable. Tests use
+// this hook to verify the cache contract; production callers must
+// not touch the cache (the path is stable for the process lifetime).
+func resetExePathForTest() {
+	cachedExePath = ""
+	cachedExePathOnce = sync.Once{}
 }

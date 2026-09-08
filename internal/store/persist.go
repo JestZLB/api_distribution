@@ -1,12 +1,21 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"api_distribution/internal/types"
 )
+
+// upsertDailyBuf is a package-level scratch buffer reused across
+// every upsertDaily call (and therefore every per-date map encode)
+// so SaveDaily persists 30 days × 4 maps without allocating a fresh
+// ~MB-class byte slice per column. The buffer is only touched inside
+// upsertDaily, which SaveDaily invokes serially under a single
+// goroutine, so reuse is race-free.
+var upsertDailyBuf bytes.Buffer
 
 // persistedData is the legacy JSON schema for the on-disk log snapshot.
 // It is only read during MigrateLegacyJSON to import pre-SQLite data.
@@ -146,8 +155,17 @@ func (s *Store) LoadLogs() error {
 // the next SaveLogs to be a no-op until a fresh Append advances
 // dirtyIdx again. LoadLogs + the next Append will re-establish the
 // correct invariant (see LoadLogs comment).
+//
+// G-006: in addition to the log buffer, PurgeOlderThan also evicts
+// any per-day aggregates in s.days whose date is older than the
+// retention window. This keeps the daily_stats SQLite table, the
+// in-memory s.days map, AND the G-006 monthCounts incremental in
+// sync. The "disk deletion semantics" the spec calls out — the
+// daily_stats rows on disk — still happen here, just like in
+// SaveDaily, so a restart does not resurrect the pruned days.
 func (s *Store) PurgeOlderThan(d time.Duration) int {
 	cutoff := time.Now().Add(-d).UnixNano()
+	dayCutoff := time.Now().Add(-d).Format(DayLayout)
 
 	s.mu.Lock()
 	purged := 0
@@ -182,12 +200,38 @@ func (s *Store) PurgeOlderThan(d time.Duration) int {
 		s.dirtyIdx.Store(n)
 		s.dirtyStart.Store(n)
 	}
+
+	// G-006: evict per-day aggregates older than the retention
+	// window so s.days, the daily_stats table, and monthCounts all
+	// stay consistent. The day cut-off is in DayLayout form so the
+	// string comparison below matches the rest of the codebase.
+	prunedDays := 0
+	for date := range s.days {
+		if date < dayCutoff {
+			delete(s.days, date)
+			prunedDays++
+			// Reset the G-006 incremental for this date so the
+			// rolling 30-day total excludes the evicted day.
+			if s.monthCounts != nil {
+				s.monthCounts.remove(date)
+			}
+		}
+	}
 	s.mu.Unlock()
 
 	// Best-effort: drop the same rows from the logs table. The ring
 	// buffer stays authoritative for what the UI surfaces this session.
 	_, _ = s.db.Exec(`DELETE FROM logs WHERE ts < ?`, cutoff)
-	if purged > 0 {
+	if prunedDays > 0 {
+		// Same SQL the SaveDaily retention path runs — idempotent
+		// if PurgeOverThan and SaveDaily are called back-to-back by
+		// the persist loop. Errors here are the same class as the
+		// logs DELETE above; both are intentionally swallowed
+		// because PurgeOlderThan is called from a background ticker
+		// and the in-memory state is already consistent.
+		_, _ = s.db.Exec(`DELETE FROM daily_stats WHERE date < ?`, dayCutoff)
+	}
+	if purged > 0 || prunedDays > 0 {
 		// Both the in-memory ring buffer and the persisted logs table
 		// lost entries; notify subscribers so cached stats (totals,
 		// hourly buckets that overlap the purge window, etc.) get
@@ -230,6 +274,16 @@ func (s *Store) SaveDaily(retentionDays int) error {
 		for _, d := range kept {
 			if d.Date < cutoff {
 				delete(s.days, d.Date)
+				// G-006: also clear the incremental entry so the
+				// monthCounts rolling 30-day total excludes the
+				// evicted day. PurgeOlderThan already does this
+				// for its own retention pass, but SaveDaily can
+				// also be the only place a day leaves memory
+				// (e.g. when retentionDays is configured but
+				// PurgeOlderThan is disabled).
+				if s.monthCounts != nil {
+					s.monthCounts.remove(d.Date)
+				}
 				pruned = true
 			}
 		}

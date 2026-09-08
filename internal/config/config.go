@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,13 @@ import (
 
 	"api_distribution/internal/types"
 )
+
+// configEncodeBuf is a package-level scratch buffer reused across
+// every Save/Apply/Load default-write so repeated JSON encoding does
+// not allocate a fresh ~50 KiB each call. The buffer is only used
+// inside writeLocked, which is itself serialised by m.writeMu so the
+// reuse is safe.
+var configEncodeBuf bytes.Buffer
 
 // Manager is responsible for loading and saving Config atomically.
 //
@@ -236,10 +244,17 @@ func (m *Manager) Path() string {
 // (used by Save / Apply so the tmp-file + rename dance doesn't race
 // against another concurrent writer).
 func (m *Manager) writeLocked(cfg types.Config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
+	// Reuse the package-level configEncodeBuf across calls so each
+	// Save does not allocate a fresh ~50 KiB marshalled payload.
+	// writeLocked is serialised by m.writeMu, so the buffer reuse
+	// is race-free.
+	configEncodeBuf.Reset()
+	enc := json.NewEncoder(&configEncodeBuf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cfg); err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+	data := configEncodeBuf.Bytes()
 
 	dir := filepath.Dir(m.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

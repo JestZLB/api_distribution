@@ -279,6 +279,15 @@ type Config struct {
 	// before forcibly terminating connections. 0 falls back to the
 	// built-in default (5s); values >60 are rejected by Validate.
 	ShutdownTimeoutSec int `json:"shutdownTimeoutSec"`
+
+	// MaxRequestBodyMB caps the request body (and the buffered
+	// non-streaming response body) accepted by the forwarding proxy,
+	// in MiB. The gateway intentionally does NOT enforce IDE-level
+	// context limits — that is the client's job — so the default is a
+	// generous memory-safety net (256 MiB) rather than a context
+	// cutoff. 0 falls back to the default; range 1-1024 enforced by
+	// Validate.
+	MaxRequestBodyMB int `json:"maxRequestBodyMB"`
 }
 
 // Normalize fills in zero-value fields with defaults so the on-disk
@@ -308,6 +317,9 @@ func (c *Config) Normalize() {
 	if c.ShutdownTimeoutSec == 0 {
 		c.ShutdownTimeoutSec = def.ShutdownTimeoutSec
 	}
+	if c.MaxRequestBodyMB == 0 {
+		c.MaxRequestBodyMB = def.MaxRequestBodyMB
+	}
 	if c.Locale == "" {
 		c.Locale = def.Locale
 	}
@@ -328,6 +340,9 @@ func (c Config) Validate() error {
 	}
 	if c.ShutdownTimeoutSec < 0 || c.ShutdownTimeoutSec > 60 {
 		return fmt.Errorf("shutdownTimeoutSec must be between 0 and 60 seconds, got %d", c.ShutdownTimeoutSec)
+	}
+	if c.MaxRequestBodyMB < 1 || c.MaxRequestBodyMB > 1024 {
+		return fmt.Errorf("maxRequestBodyMB must be between 1 and 1024, got %d", c.MaxRequestBodyMB)
 	}
 	// Aliases must reference a known provider id.
 	providerIDs := make(map[string]struct{}, len(c.Providers))
@@ -404,6 +419,7 @@ func DefaultConfig() Config {
 		ModelAliases:       []ModelAlias{},
 		ShutdownTimeoutSec: 5,
 		Locale:             "en-US",
+		MaxRequestBodyMB:   256,
 	}
 }
 

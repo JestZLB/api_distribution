@@ -63,3 +63,12 @@ export function redactKey(key: string): string {
   if (!key) return ''
   return '*'.repeat(Math.max(8, key.length))
 }
+
+// redactKeyForExport is a fixed-width placeholder used by the Settings
+// page's "Export config" download. Exporting via `redactKey` would
+// allocate an `*`-string as long as the API key — large configs with
+// many providers / client keys end up with hundreds of kilobytes of
+// useless `*` characters in the exported JSON. A constant eight-char
+// placeholder is unambiguous, keeps the export compact, and still
+// signals that the field was intentionally scrubbed.
+export const redactKeyForExport = (key: string): string => (key ? '********' : '')

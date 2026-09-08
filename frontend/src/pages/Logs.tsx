@@ -45,7 +45,7 @@ export function Logs() {
   const logs = useConfigStore((s) => s.logs)
   const refreshLogs = useConfigStore((s) => s.refreshLogs)
   const lastLoadedAt = useConfigStore((s) => s.lastLoadedAt)
-  const logsError = useConfigStore((s) => s.refreshErrors.logs)
+  const logsError = useConfigStore((s) => s.refreshErrorLogs)
   const t = useT()
   const clearLogs = useConfigStore((s) => s.clearLogs)
 

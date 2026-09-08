@@ -18,6 +18,75 @@ const (
 	MaxLogEntries = 2000
 )
 
+// monthCounter maintains per-calendar-day request counts so the
+// dashboard's Month rolling-window (last 30 days) can be answered
+// without re-iterating s.days. It is owned by Store but has its own
+// RWMutex so future readers (e.g. an admin endpoint) can poll
+// without acquiring s.mu — for now every read happens inside
+// s.mu.RLock, which keeps lock ordering consistent (s.mu before
+// monthCounts.mu) and avoids deadlocks.
+type monthCounter struct {
+	mu    sync.RWMutex
+	byDay map[string]int64
+}
+
+// newMonthCounter constructs an empty monthCounter. The caller is
+// expected to wire it into a Store via Store.monthCounts.
+func newMonthCounter() *monthCounter {
+	return &monthCounter{byDay: make(map[string]int64)}
+}
+
+// add increments the counter for the given calendar-day key. The
+// Store is the only writer; see the lock-ordering comment on
+// monthCounter itself.
+func (m *monthCounter) add(date string) {
+	m.mu.Lock()
+	m.byDay[date]++
+	m.mu.Unlock()
+}
+
+// remove deletes the counter for the given date. Called by
+// PurgeOlderThan / SaveDaily when a daily aggregate is evicted so
+// the monthCounts total stays in sync with the per-day totals.
+func (m *monthCounter) remove(date string) {
+	m.mu.Lock()
+	delete(m.byDay, date)
+	m.mu.Unlock()
+}
+
+// pruneBefore removes counters older than the cutoff (string
+// comparison works because the keys are DayLayout — YYYY-MM-DD).
+// Called from maybeRollWindow so the map never grows past 30+ days.
+func (m *monthCounter) pruneBefore(cutoff string) {
+	m.mu.Lock()
+	for d := range m.byDay {
+		if d < cutoff {
+			delete(m.byDay, d)
+		}
+	}
+	m.mu.Unlock()
+}
+
+// get returns the counter for the given date (0 if absent).
+func (m *monthCounter) get(date string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.byDay[date]
+}
+
+// sumSince sums the counters for every date >= cutoff.
+func (m *monthCounter) sumSince(cutoff string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var total int64
+	for d, c := range m.byDay {
+		if d >= cutoff {
+			total += c
+		}
+	}
+	return total
+}
+
 // Store is the central log + stats store used by the proxy server.
 type Store struct {
 	mu   sync.RWMutex
@@ -68,6 +137,47 @@ type Store struct {
 	// the methods do, so this is free in production.
 	statsComputeCount atomic.Int64
 	swcComputeCount   atomic.Int64
+
+	// G-006 incremental maintenance. Every field below is updated in
+	// lockstep with s.days (under s.mu) by Append, so Stats /
+	// StatsWithComparison can answer the dashboard's hot questions
+	// without re-iterating s.logs (the 2000-entry ring buffer) or
+	// re-aggregating s.days for today-only fields.
+
+	// recentByClientKey is the running count of "last 24h requests
+	// per client-key label" — the source of truth for
+	// Stats.RequestsByClientKeyRecent / swc.RequestsByClientKeyRecent.
+	// The window rolls forward in maybeRollWindow when the wall
+	// clock crosses an hour boundary.
+	recentByClientKey map[string]int64
+
+	// recentByClientKeyByHour is the per-hour breakdown used by
+	// maybeRollWindow to roll recentByClientKey. Entries are
+	// bucketed by the entry's hour (truncateHour(e.Timestamp)), so
+	// back-dated timestamps do not poison the current window.
+	// Stored under s.mu alongside recentByClientKey.
+	recentByClientKeyByHour map[int64]map[string]int64
+
+	// recentHourStamp is the unix-hour value of the most recent
+	// roll. When the wall clock moves to a new hour, the roll
+	// discards every bucket older than (curHour - 24) and rebuilds
+	// recentByClientKey from what survives.
+	recentHourStamp int64
+
+	// todayByModel / todayByProvider carry the current calendar
+	// day's per-alias / per-provider counts. StatsWithComparison
+	// uses todayByModel.sum() to short-circuit the d.Date == today
+	// branch for TodayRequests. TodayDate guards against reading a
+	// stale accumulator after midnight.
+	todayByModel    map[string]int64
+	todayByProvider map[string]int64
+	todayDate       string
+
+	// monthCounts is the rolling 30-day per-day request total. It
+	// is consulted by StatsWithComparison for Month.Requests (and
+	// possibly TodayRequests in future revisions). PurgeOlderThan /
+	// SaveDaily call monthCounts.remove() when evicting a day.
+	monthCounts *monthCounter
 }
 
 // New creates an empty Store backed by an in-memory SQLite database.
@@ -110,6 +220,12 @@ func (s *Store) fireOnChange() {
 // it equals the seq of the just-appended entry plus one; the ring slot
 // that entry lives in is (dirtyIdx-1) % MaxLogEntries. SaveLogs reads
 // dirtyIdx - dirtyStart to know how many entries are unflushed.
+//
+// Append updates the G-006 incremental counters in lockstep with
+// s.days so Stats / StatsWithComparison can answer the dashboard's
+// hot questions without re-iterating s.logs. The first Append on a
+// freshly-opened Store also bootstraps the incrementals via
+// ensureIncrementalsLocked.
 func (s *Store) Append(e types.LogEntry) {
 	s.mu.Lock()
 	// Increment dirtyIdx FIRST so any concurrent reader sees a high
@@ -126,9 +242,141 @@ func (s *Store) Append(e types.LogEntry) {
 
 	s.getOrCreateDay(dateKey(e.Timestamp)).add(e)
 	s.dirty.Store(true)
+	s.ensureIncrementalsLocked()
+	s.updateIncrementalsLocked(e)
 	s.mu.Unlock()
 
 	s.fireOnChange()
+}
+
+// ensureIncrementalsLocked allocates the G-006 incremental maps on
+// first use. It must be called under s.mu so a concurrent caller
+// observes a fully initialised store. The maps are never freed once
+// allocated — the cost of repeated init would dwarf the cost of
+// keeping a few small maps live for the lifetime of the process.
+func (s *Store) ensureIncrementalsLocked() {
+	if s.recentByClientKey != nil && s.monthCounts != nil {
+		return
+	}
+	s.recentByClientKey = make(map[string]int64)
+	s.recentByClientKeyByHour = make(map[int64]map[string]int64)
+	s.todayByModel = make(map[string]int64)
+	s.todayByProvider = make(map[string]int64)
+	s.monthCounts = newMonthCounter()
+}
+
+// updateIncrementalsLocked folds one LogEntry into the G-006
+// incremental maps. Caller must hold s.mu. Behaviour for each
+// incremental:
+//
+//   - recentByClientKey (and its per-hour breakdown): +1 if the
+//     entry's timestamp is within the last 24h of wall-clock time
+//     AND the entry has a non-empty client-key label. Bucketing by
+//     the entry's own hour means back-dated entries do not pollute
+//     the current window.
+//
+//   - todayByModel / todayByProvider: +1 if the entry's date key
+//     matches the current calendar day. After midnight the maps are
+//     reset in maybeRollWindow().
+//
+//   - monthCounts: +1 for the entry's calendar-day key. The map is
+//     pruned of dates older than (today - 30d) inside maybeRollWindow.
+//
+// The function also lazily rolls the recent window if the wall clock
+// crossed into a new hour since the last append — that handles the
+// long-idle case (no Stats call for hours) without losing accuracy.
+func (s *Store) updateIncrementalsLocked(e types.LogEntry) {
+	now := time.Now()
+	curHour := now.Truncate(time.Hour).Unix()
+	curDate := now.Format(DayLayout)
+
+	if s.recentHourStamp != curHour {
+		s.rollRecentLocked(curHour)
+	}
+	if s.todayDate != curDate {
+		s.todayByModel = make(map[string]int64)
+		s.todayByProvider = make(map[string]int64)
+		s.todayDate = curDate
+	}
+	// monthCounts entries older than 30 days are pruned here as a
+	// defence-in-depth: maybeRollWindow also prunes, but if Stats
+	// isn't called for a long stretch the map would otherwise grow
+	// unbounded.
+	monthCutoff := now.AddDate(0, 0, -29).Format(DayLayout)
+	s.monthCounts.pruneBefore(monthCutoff)
+
+	cutoff := now.Add(-24 * time.Hour).UnixNano()
+	if e.ClientKeyLabel != "" && e.Timestamp >= cutoff {
+		h := truncateHour(e.Timestamp)
+		bucket := s.recentByClientKeyByHour[h]
+		if bucket == nil {
+			bucket = make(map[string]int64)
+			s.recentByClientKeyByHour[h] = bucket
+		}
+		bucket[e.ClientKeyLabel]++
+		s.recentByClientKey[e.ClientKeyLabel]++
+	}
+
+	entryDate := dateKey(e.Timestamp)
+	if entryDate == curDate {
+		if e.Alias != "" {
+			s.todayByModel[e.Alias]++
+		}
+		if e.ProviderName != "" {
+			s.todayByProvider[e.ProviderName]++
+		}
+	}
+	s.monthCounts.add(entryDate)
+}
+
+// rollRecentLocked rebuilds recentByClientKey from the per-hour
+// buckets that are still inside the 24-hour window. Caller must hold
+// s.mu. curHour is the wall-clock hour the roll targets (always
+// time.Now().Truncate(time.Hour).Unix()).
+func (s *Store) rollRecentLocked(curHour int64) {
+	cutoff := curHour - 24*3600
+	newRecent := make(map[string]int64)
+	for h, bucket := range s.recentByClientKeyByHour {
+		if h >= cutoff {
+			for k, c := range bucket {
+				newRecent[k] += c
+			}
+		}
+	}
+	// Drop the expired buckets so the per-hour map does not leak
+	// memory across days.
+	for h := range s.recentByClientKeyByHour {
+		if h < cutoff {
+			delete(s.recentByClientKeyByHour, h)
+		}
+	}
+	s.recentByClientKey = newRecent
+	s.recentHourStamp = curHour
+}
+
+// maybeRollWindow is called by Stats / StatsWithComparison to ensure
+// the incrementals reflect the current wall clock. It holds s.mu
+// only for the duration of the roll (O(unique hours + unique days
+// in the recent window) ≈ a few dozen entries).
+func (s *Store) maybeRollWindow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureIncrementalsLocked()
+
+	now := time.Now()
+	curHour := now.Truncate(time.Hour).Unix()
+	curDate := now.Format(DayLayout)
+
+	if s.recentHourStamp != curHour {
+		s.rollRecentLocked(curHour)
+	}
+	if s.todayDate != curDate {
+		s.todayByModel = make(map[string]int64)
+		s.todayByProvider = make(map[string]int64)
+		s.todayDate = curDate
+	}
+	monthCutoff := now.AddDate(0, 0, -29).Format(DayLayout)
+	s.monthCounts.pruneBefore(monthCutoff)
 }
 
 // getOrCreateDay returns (creating if missing) the daily aggregate for
@@ -190,6 +438,18 @@ func (s *Store) Clear() {
 	s.dirty.Store(true)
 	s.dirtyIdx.Store(0)
 	s.dirtyStart.Store(0)
+	// Reset G-006 incrementals so a fresh user-visible window starts
+	// at zero. monthCounts is rebuilt empty (the per-day map is the
+	// only "live" reference; today's ByModel / ByProvider carry
+	// forward only when the date hasn't changed, and Clear wipes
+	// that too via the fresh maps).
+	s.recentByClientKey = make(map[string]int64)
+	s.recentByClientKeyByHour = make(map[int64]map[string]int64)
+	s.recentHourStamp = 0
+	s.todayByModel = make(map[string]int64)
+	s.todayByProvider = make(map[string]int64)
+	s.todayDate = ""
+	s.monthCounts = newMonthCounter()
 	s.mu.Unlock()
 
 	// Persist-side wipe happens outside the lock so a slow disk does
@@ -222,18 +482,21 @@ func (s *Store) MarkClean() {
 // per-client-key "last 24h" counts are derived from the live log buffer.
 func (s *Store) Stats() types.Stats {
 	s.statsComputeCount.Add(1)
+	// Roll the G-006 incrementals if the wall clock crossed an
+	// hour boundary. maybeRollWindow acquires s.mu (write) briefly
+	// to rebuild recentByClientKey + reset todayBy*; after it
+	// returns we drop to the read lock for the sumDays pass.
+	s.maybeRollWindow()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	stats := s.sumDays()
-	recentCutoff := time.Now().Add(-24 * time.Hour).UnixNano()
-	for _, e := range s.logs {
-		if e.ID == "" || e.ClientKeyLabel == "" {
-			continue
-		}
-		if e.Timestamp >= recentCutoff {
-			stats.RequestsByClientKeyRecent[e.ClientKeyLabel]++
-		}
+	// Read RequestsByClientKeyRecent from the incremental map
+	// maintained by Append. This is O(unique client keys in the
+	// last 24h) — a small handful — versus the previous O(MaxLogEntries)
+	// scan over the 2000-entry ring buffer.
+	for k, c := range s.recentByClientKey {
+		stats.RequestsByClientKeyRecent[k] = c
 	}
 	return stats
 }
@@ -384,6 +647,10 @@ func snapshotDaysSorted(days map[string]*DailyAgg) []*DailyAgg {
 // TestStatsWithComparison_* tests).
 func (s *Store) StatsWithComparison() types.StatsWithComparison {
 	s.swcComputeCount.Add(1)
+	// Roll the G-006 incrementals before reading. maybeRollWindow
+	// briefly takes s.mu (write) for the rebuild, so we drop down
+	// to the read lock afterwards.
+	s.maybeRollWindow()
 	// Take a read lock just like Stats() so a concurrent Append (which
 	// grows/reallocates the ring slice under the write lock) cannot race
 	// with these unbounded reads. Without it, the every-2s UI refresh
@@ -415,8 +682,6 @@ func (s *Store) StatsWithComparison() types.StatsWithComparison {
 	prevWeekStart := now.AddDate(0, 0, -13).Format(DayLayout)
 	monthStart := now.AddDate(0, 0, -29).Format(DayLayout) // last 30 days incl today
 	prevMonthStart := now.AddDate(0, 0, -59).Format(DayLayout)
-
-	recentCutoff := now.Add(-24 * time.Hour).UnixNano()
 
 	var (
 		totalLatency     int64
@@ -557,17 +822,12 @@ func (s *Store) StatsWithComparison() types.StatsWithComparison {
 		result.RequestsByHourByModel[alias] = buckets
 	}
 
-	// Last-24h per-client-key counts come from the live log buffer
-	// (s.logs), not from the per-day aggregates. This is a second pass
-	// over a separate structure (the ring buffer) that the previous
-	// implementation also did, so we keep it as-is.
-	for _, e := range s.logs {
-		if e.ID == "" || e.ClientKeyLabel == "" {
-			continue
-		}
-		if e.Timestamp >= recentCutoff {
-			result.RequestsByClientKeyRecent[e.ClientKeyLabel]++
-		}
+	// Last-24h per-client-key counts are now served from the
+	// recentByClientKey incremental maintained by Append (see
+	// G-006). This replaces a 2000-entry scan of s.logs with an
+	// O(unique labels in the last 24h) map copy.
+	for k, c := range s.recentByClientKey {
+		result.RequestsByClientKeyRecent[k] = c
 	}
 
 	return result
@@ -590,6 +850,21 @@ func addPeriod(p *types.PeriodStats, d *DailyAgg) {
 // concurrent calls. Production callers should never need this.
 func (s *Store) StatsComputeCountForTest() int64 {
 	return s.statsComputeCount.Load()
+}
+
+// DirtyIdxForTest exposes the monotonic append counter used by
+// SaveLogs to delimit the unflushed range. The shutdown-race
+// regression test (app_shutdown_race_test.go) asserts that
+// shutdown collapses dirtyStart up to dirtyIdx; a leak here would
+// silently double-write or skip rows on the next startup.
+func (s *Store) DirtyIdxForTest() int64 {
+	return s.dirtyIdx.Load()
+}
+
+// DirtyStartForTest exposes the persisted-up-to marker used by
+// SaveLogs to delimit the unflushed range. See DirtyIdxForTest.
+func (s *Store) DirtyStartForTest() int64 {
+	return s.dirtyStart.Load()
 }
 
 // SwcComputeCountForTest returns the number of times

@@ -199,6 +199,47 @@ func resetClients(t *testing.T) {
 	clientsMu.Unlock()
 }
 
+// TestNewClient_TransportPoolBounds verifies the connection-pool
+// tuning specified in memory-audit-fixes-golang (Task 1 / G-012):
+//
+//   - MaxIdleConns = 10   (was 100 — global idle ceiling)
+//   - MaxIdleConnsPerHost = 5 (was 20 — per-host idle ceiling)
+//   - MaxConnsPerHost = 50 (new — total per-host ceiling, including
+//     in-flight + idle)
+//   - IdleConnTimeout = 90s (unchanged)
+//
+// These caps keep the cache from accumulating ~2000 idle TCP sockets
+// across many configured providers; a fresh client must hand back a
+// transport whose fields exactly match the spec.
+func TestNewClient_TransportPoolBounds(t *testing.T) {
+	c := newClient(types.Provider{
+		ID:      "pool",
+		Name:    "pool",
+		Type:    types.ProviderOpenAI,
+		BaseURL: "https://example.com/v1",
+		APIKey:  "sk",
+	})
+	if c == nil || c.http == nil || c.http.Transport == nil {
+		t.Fatalf("newClient returned a client without a transport")
+	}
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", c.http.Transport)
+	}
+	if tr.MaxIdleConns != 10 {
+		t.Errorf("MaxIdleConns = %d, want 10", tr.MaxIdleConns)
+	}
+	if tr.MaxIdleConnsPerHost != 5 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 5", tr.MaxIdleConnsPerHost)
+	}
+	if tr.MaxConnsPerHost != 50 {
+		t.Errorf("MaxConnsPerHost = %d, want 50", tr.MaxConnsPerHost)
+	}
+	if tr.IdleConnTimeout != 90*time.Second {
+		t.Errorf("IdleConnTimeout = %s, want 90s", tr.IdleConnTimeout)
+	}
+}
+
 // TestReapIdle_SkipsActiveClient verifies that a client with an
 // in-flight request is never evicted, even when its lastUsed timestamp
 // is far past the idle threshold (e.g. a long-running stream).

@@ -6,6 +6,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -33,9 +34,12 @@ import (
 )
 
 const (
-	// maxRequestBodyBytes caps the accepted request body size to avoid
-	// memory exhaustion from malicious or misconfigured clients.
-	maxRequestBodyBytes = 10 << 20 // 10 MiB
+	// maxRequestBodyMB is the default memory-safety net for request
+	// and buffered non-streaming response bodies. The gateway does NOT
+	// enforce IDE-level context limits (that is the client's job), so
+	// this only guards against genuinely oversized / hostile payloads
+	// and is overridable via Config.MaxRequestBodyMB.
+	maxRequestBodyMB = 256
 )
 
 type authKeyType struct{}
@@ -276,7 +280,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		matchedKey = matchClientKey(r, cfg.ClientKeys)
 	}
 
-	body, ok := readRequestBody(w, r, maxRequestBodyBytes)
+	// maxBody is the memory-safety net for request / buffered response
+	// bodies, derived from the configurable MaxRequestBodyMB (which
+	// defaults to maxRequestBodyMB const). It is deliberately far above
+	// any realistic IDE/client context so the gateway never acts as a
+	// context-length enforcer. A zero config value (pre-normalize
+	// configs) falls back to the default rather than collapsing the cap.
+	maxMB := cfg.MaxRequestBodyMB
+	if maxMB <= 0 {
+		maxMB = maxRequestBodyMB
+	}
+	maxBody := int64(maxMB) << 20
+
+	body, ok := readRequestBody(w, r, maxBody)
 	if !ok {
 		atomic.AddInt64(&s.status.ErrorCount, 1)
 		return
@@ -370,22 +386,40 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	log.StatusCode = resp.StatusCode
 
-	// Copy upstream headers, then stream.
+	// Copy upstream headers, then relay the body. Content-Length is
+	// dropped so Go recomputes it from the bytes actually written — the
+	// response body may be transformed (Anthropic path) or relayed
+	// differently than upstream, and a stale Content-Length could hang
+	// or truncate the client.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.Header().Del("Content-Length")
 
 	if streaming {
+		w.WriteHeader(resp.StatusCode)
 		s.streamResponseWithUsage(w, resp.Body, &log)
 	} else {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodyBytes+1))
-		if int64(len(respBody)) > maxRequestBodyBytes {
+		// Buffer the full non-streaming response so usage can be parsed;
+		// only the generous configurable safety net applies, never a
+		// tight context-style cutoff. Check the limit BEFORE writing the
+		// status so an oversized upstream response yields a clean 502.
+		respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+		if rerr != nil {
+			log.Error = rerr.Error()
+			atomic.AddInt64(&s.status.ErrorCount, 1)
+			http.Error(w, errBody(rerr), http.StatusBadGateway)
+			return
+		}
+		if int64(len(respBody)) > maxBody {
+			log.Error = "upstream response too large"
+			atomic.AddInt64(&s.status.ErrorCount, 1)
 			http.Error(w, `{"error":{"message":"upstream response too large","type":"upstream_error"}}`, http.StatusBadGateway)
 			return
 		}
+		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
 		s.collectNonStream(respBody, &log)
 	}
@@ -454,12 +488,16 @@ func (s *Server) handleAnthropicChat(
 	defer resp.Body.Close()
 
 	// Copy upstream headers, then make sure the response shape matches
-	// what an OpenAI client expects.
+	// what an OpenAI client expects. We MUST drop Content-Length: the
+	// body is transformed to the OpenAI shape below, whose byte length
+	// differs from the upstream Anthropic body — a stale Content-Length
+	// would make the client hang waiting for bytes or truncate early.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Del("Content-Length")
 	if streaming {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -495,28 +533,19 @@ func (s *Server) handleAnthropicChat(
 	log.LatencyMs = time.Since(start).Milliseconds()
 }
 
-func (s *Server) streamResponse(w http.ResponseWriter, src io.Reader) {
-	// We don't tokenize here, just count best-effort from chunks.
-	// We type-assert w to http.Flusher so SSE clients see each chunk
-	// immediately instead of waiting for net/http's 4 KiB buffer to
-	// fill. The assertion silently no-ops when the writer isn't a
-	// Flusher (e.g. httptest.ResponseRecorder in tests).
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
+// sseReaderPool caches *bufio.Reader instances for streamResponseWithUsage
+// so each SSE stream doesn't allocate a fresh 64 KiB buffer. The reader
+// is Reset(src) on Get and Put back when the stream ends, which discards
+// any leftover bytes via Reset's documented behaviour.
+//
+// We cache *bufio.Reader (not bufio.Scanner) because Scanner.Text() copies
+// each line into a fresh string; ReadBytes('\n') returns a []byte that
+// already aliases the reader's internal buffer, so a 200 KiB Anthropic
+// event no longer allocates a 200 KiB string per chunk.
+var sseReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, 64*1024)
+	},
 }
 
 // streamResponseWithUsage reads an SSE stream line-by-line, parses
@@ -524,62 +553,71 @@ func (s *Server) streamResponse(w http.ResponseWriter, src io.Reader) {
 // completion_tokens), and records it in the log entry. Every non-empty
 // data line is forwarded to w. The stream ends when "data: [DONE]" is
 // received.
+//
+// There is intentionally no per-line length ceiling: bufio.Reader
+// grows its internal buffer to accommodate arbitrarily long lines, so
+// a huge single SSE frame is forwarded whole instead of truncating the
+// stream. A real read error or client disconnect still terminates the
+// loop.
 func (s *Server) streamResponseWithUsage(w http.ResponseWriter, src io.Reader, log *types.LogEntry) {
-	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20) // 64 KiB initial, 1 MiB max
-	flusher, _ := w.(http.Flusher)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
+	reader := sseReaderPool.Get().(*bufio.Reader)
+	reader.Reset(src)
+	defer sseReaderPool.Put(reader)
 
-		if data == "[DONE]" {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher, _ := w.(http.Flusher)
+
+	for {
+		// ReadBytes('\n') appends the line (with the trailing \n) into
+		// the reader's internal buffer — no per-line string copy like
+		// scanner.Text() would do.
+		raw, err := reader.ReadBytes('\n')
+
+		// ReadBytes includes the trailing \n in raw; trim it so the
+		// rest of the logic sees the same shape scanner.Text() used to.
+		line := bytes.TrimSuffix(raw, []byte("\n"))
+
+		if len(line) > 0 && bytes.HasPrefix(line, []byte("data: ")) {
+			data := line[len("data: "):]
+
+			if bytes.Equal(data, []byte("[DONE]")) {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return
+			}
+
+			// Try to parse usage from the chunk.
+			var chunk struct {
+				Usage *struct {
+					PromptTokens     int64 `json:"prompt_tokens"`
+					CompletionTokens int64 `json:"completion_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(data, &chunk); err == nil && chunk.Usage != nil {
+				// Clamp to int32 before storing into LogEntry's int32 fields
+				// so a hostile upstream returning 1e20 cannot wrap into a
+				// negative int and corrupt daily totals.
+				log.InputTokens = clampToInt32(chunk.Usage.PromptTokens)
+				log.OutputTokens = clampToInt32(chunk.Usage.CompletionTokens)
+			}
+
+			// Write the original line to the client.
+			fmt.Fprintf(w, "data: %s\n\n", data)
 			if flusher != nil {
 				flusher.Flush()
 			}
+		}
+
+		if err != nil {
+			// ReadBytes returns io.EOF (no error) on clean EOF — match
+			// the old scanner.Err() == nil branch: don't flag log.Error.
+			// Anything else is a real read error or a client disconnect.
+			if err != io.EOF && !isClientDisconnect(err) {
+				log.Error = fmt.Sprintf("upstream sse scan: %v", err)
+			}
 			return
 		}
-
-		// Try to parse usage from the chunk.
-		var chunk struct {
-			Usage *struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal([]byte(data), &chunk); err == nil && chunk.Usage != nil {
-			// Clamp to int32 before storing into LogEntry's int32 fields
-			// so a hostile upstream returning 1e20 cannot wrap into a
-			// negative int and corrupt daily totals.
-			log.InputTokens = clampToInt32(chunk.Usage.PromptTokens)
-			log.OutputTokens = clampToInt32(chunk.Usage.CompletionTokens)
-		}
-
-		// Write the original line to the client.
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-
-	// Scanner stopped: distinguish clean EOF (upstream closed normally)
-	// from a real read error (truncated line, broken pipe, etc.). A clean
-	// EOF or nil error means the upstream finished without us receiving a
-	// "data: [DONE]" sentinel — that's not necessarily an error, but a
-	// truncated stream (Err() != nil) is worth surfacing in the log so
-	// operators can spot broken upstreams.
-	//
-	// We also distinguish *client-side* disconnects (the browser/CLI
-	// hung up mid-stream) from real upstream read errors — client
-	// disconnects surface as "broken pipe" / "use of closed network
-	// connection" / io.EOF-with-context.Canceled, and they don't
-	// represent a problem with the upstream response itself, so we
-	// must not flag the log entry as failed.
-	if err := scanner.Err(); err != nil && !isClientDisconnect(err) {
-		log.Error = fmt.Sprintf("upstream sse scan: %v", err)
 	}
 }
 

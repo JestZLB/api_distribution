@@ -59,8 +59,18 @@ interface ConfigState {
   loading: boolean
   /** Boot-time connection state for the Wails backend. */
   bootStatus: 'initializing' | 'ready' | 'degraded' | 'failed'
-  /** Last refresh error per data slice (e.g. 'logs', 'stats', 'load'). */
-  refreshErrors: Record<string, string | null>
+  /**
+   * Last refresh error per data slice. Previously a single
+   * `refreshErrors: Record<string, string | null>` object that
+   * re-rendered every reader (including BootErrorScreen) on every
+   * transient error in any slice. Now four independent scalar
+   * fields so a failing stats fetch doesn't flip the logs error
+   * flag for subscribers that don't care about stats.
+   */
+  refreshErrorStats: string | null
+  refreshErrorLogs: string | null
+  refreshErrorServer: string | null
+  refreshErrorLoad: string | null
   /** Last successful load timestamp (ms since epoch). */
   lastLoadedAt: number | null
   /** Set when the boot loader failed. */
@@ -113,7 +123,10 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
   logs: [],
   loading: false,
   bootStatus: 'initializing' as ConfigState['bootStatus'],
-  refreshErrors: {} as ConfigState['refreshErrors'],
+  refreshErrorStats: null,
+  refreshErrorLogs: null,
+  refreshErrorServer: null,
+  refreshErrorLoad: null,
   lastLoadedAt: null,
   bootError: null,
 
@@ -162,7 +175,10 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
         bootStatus: 'ready',
         bootError: null,
         lastLoadedAt: Date.now(),
-        refreshErrors: {},
+        refreshErrorStats: null,
+        refreshErrorLogs: null,
+        refreshErrorServer: null,
+        refreshErrorLoad: null,
       })
     } catch (err) {
       set({
@@ -177,19 +193,18 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
   async refreshServer() {
     try {
       const status = await App.GetServerStatus()
-      set({serverStatus: status})
+      set({serverStatus: status, refreshErrorServer: null})
     } catch (err) {
-      set((s) => ({refreshErrors: {...s.refreshErrors, server: String(err)}}))
+      set({refreshErrorServer: String(err)})
     }
   },
 
   async refreshStats() {
     try {
       const stats = await App.GetStats()
-      set({stats})
-      set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+      set({stats, refreshErrorStats: null})
     } catch (err) {
-      set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(err)}}))
+      set({refreshErrorStats: String(err)})
     }
   },
 
@@ -237,13 +252,13 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
           prevWC.month?.outputTokens !== statsWC.month?.outputTokens ||
           prevWC.prevMonth?.requests !== statsWC.prevMonth?.requests
         if (statsShallowEqual(prevStats, nextStats) && !dayChanged) {
-          set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+          set({refreshErrorStats: null})
         } else {
           set({
             stats: nextStats,
             statsWithComparison: statsWC as unknown as StatsWithComparison,
+            refreshErrorStats: null,
           })
-          set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
         }
       } catch (err) {
         // Fallback to basic stats if comparison endpoint not available
@@ -251,13 +266,12 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
           const stats = await App.GetStats()
           const prevStats = get().stats
           if (statsShallowEqual(prevStats, stats)) {
-            set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+            set({refreshErrorStats: null})
           } else {
-            set({stats})
-            set((s) => ({refreshErrors: {...s.refreshErrors, stats: null}}))
+            set({stats, refreshErrorStats: null})
           }
         } catch (innerErr) {
-          set((s) => ({refreshErrors: {...s.refreshErrors, stats: String(innerErr)}}))
+          set({refreshErrorStats: String(innerErr)})
         }
       }
     }
@@ -282,13 +296,12 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
         // the logs table doesn't re-render every 3s poll for nothing.
         const prevLogs = get().logs
         if (logsEqual(prevLogs, logs)) {
-          set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+          set({refreshErrorLogs: null})
         } else {
-          set({logs})
-          set((s) => ({refreshErrors: {...s.refreshErrors, logs: null}}))
+          set({logs, refreshErrorLogs: null})
         }
       } catch (err) {
-        set((s) => ({refreshErrors: {...s.refreshErrors, logs: String(err)}}))
+        set({refreshErrorLogs: String(err)})
       }
     }
     inflightLogsRefresh = run().finally(() => {
@@ -325,10 +338,11 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
         logs,
         providers: providers as unknown as Provider[],
         modelAliases: aliases as unknown as ModelAlias[],
+        refreshErrorLoad: null,
+        lastLoadedAt: Date.now(),
       })
-      set((s) => ({refreshErrors: {...s.refreshErrors, load: null}, lastLoadedAt: Date.now()}))
     } catch (err) {
-      set((s) => ({refreshErrors: {...s.refreshErrors, load: String(err)}}))
+      set({refreshErrorLoad: String(err)})
     }
   },
 
@@ -407,10 +421,10 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
         .refreshStatsWithComparison()
         .catch((err) => {
           // The error is already recorded inside refreshStatsWithComparison
-          // (refreshErrors.stats), but record it here as well in case the
+          // (refreshErrorStats), but record it here as well in case the
           // comparison path fails before reaching the fallback.
           const message = err instanceof Error ? err.message : String(err)
-          set((s) => ({refreshErrors: {...s.refreshErrors, stats: message}}))
+          set({refreshErrorStats: message})
         })
     })
   },
@@ -425,7 +439,7 @@ export const useConfigStore = create<ConfigState>((set, get) => ({
         .refreshLogs()
         .catch((err) => {
           const message = err instanceof Error ? err.message : String(err)
-          set((s) => ({refreshErrors: {...s.refreshErrors, logs: message}}))
+          set({refreshErrorLogs: message})
         })
     })
   },

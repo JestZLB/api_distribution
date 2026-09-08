@@ -8,8 +8,6 @@ package system
 
 import (
 	"fmt"
-	"os"
-	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -38,15 +36,9 @@ func openRunKey(readOnly bool) (registry.Key, error) {
 	return registry.OpenKey(registry.CURRENT_USER, runKeyPath, access)
 }
 
-// quotedExePath returns the current executable path wrapped in
-// double quotes so paths with spaces survive registry parsing.
-func quotedExePath() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("locate executable: %w", err)
-	}
-	return `"` + strings.ReplaceAll(exe, `"`, `\"`) + `"`, nil
-}
+// quotedExePath is defined in autostart.go (platform-neutral) so both
+// the Windows implementation (below) and any future platforms share
+// the same process-lifetime cached executable lookup. G-019.
 
 // Enabled reads the Run value and reports whether it currently
 // points at us. A missing value is treated as "not enabled".

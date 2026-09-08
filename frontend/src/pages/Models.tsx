@@ -33,9 +33,24 @@ function getPresetsForProvider(provider: Provider | undefined): string[] {
   if (!provider) return []
   const type = (provider.type || '').toLowerCase()
   const preset = MODEL_PRESETS[type] ?? []
-  // Merge presets with provider's own model list, deduped
+  // Merge presets with provider's own model list, deduped. Avoid
+  // allocating a `new Set` per keystroke by walking both arrays in a
+  // single pass and tracking seen values in a plain object map.
   const providerModels = provider.models ?? []
-  const merged = [...new Set([...preset, ...providerModels])]
+  const seen: Record<string, true> = {}
+  const merged: string[] = []
+  for (const m of preset) {
+    if (!seen[m]) {
+      seen[m] = true
+      merged.push(m)
+    }
+  }
+  for (const m of providerModels) {
+    if (!seen[m]) {
+      seen[m] = true
+      merged.push(m)
+    }
+  }
   return merged
 }
 
@@ -64,7 +79,11 @@ export function Models() {
 
   const [drawerWidth, setDrawerWidth] = useState<number | '100%'>(520)
   useEffect(() => {
-    const update = () => setDrawerWidth(window.innerWidth < 600 ? '100%' : 520)
+    const update = () =>
+      setDrawerWidth((prev) => {
+        const next = window.innerWidth < 600 ? '100%' : 520
+        return prev === next ? prev : next
+      })
     update()
     window.addEventListener('resize', update)
     return () => window.removeEventListener('resize', update)
@@ -74,23 +93,29 @@ export function Models() {
     return new Map(providers.map((p) => [p.id, p]))
   }, [providers])
 
+  // Precompute the per-alias search haystack so typing in the search
+  // box doesn't re-join / re-lowercase each alias's strings on every
+  // keystroke. Keyed on the alias roster + the provider-by-id map so
+  // the map invalidates whenever either input moves.
+  const haystackByAliasId = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const a of modelAliases) {
+      const provider = providerById.get(a.providerId)
+      m.set(
+        a.id,
+        [a.alias, a.providerModel, a.description, provider?.name ?? '', ...(a.tags ?? [])]
+          .join(' ')
+          .toLowerCase(),
+      )
+    }
+    return m
+  }, [modelAliases, providerById])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     if (!q) return modelAliases
-    return modelAliases.filter((a) => {
-      const provider = providerById.get(a.providerId)
-      const haystack = [
-        a.alias,
-        a.providerModel,
-        a.description,
-        provider?.name ?? '',
-        ...(a.tags ?? []),
-      ]
-        .join(' ')
-        .toLowerCase()
-      return haystack.includes(q)
-    })
-  }, [modelAliases, search, providerById])
+    return modelAliases.filter((a) => (haystackByAliasId.get(a.id) ?? '').includes(q))
+  }, [modelAliases, search, haystackByAliasId])
 
   async function handleSave(alias: ModelAlias) {
     try {
@@ -242,7 +267,7 @@ export function Models() {
                     <Button
                       size="small"
                       type="text"
-                      aria-label="Delete alias"
+                      aria-label={t('models.deleteAlias')}
                       onClick={() => confirmDelete(alias)}
                       danger
                       icon={<LuTrash2 className="size-3.5" />}
@@ -311,6 +336,7 @@ export function Models() {
           <AliasForm
             alias={editing}
             providers={providers}
+            providerById={providerById}
             existingAliases={modelAliases}
             onChange={setEditing}
             onSave={() => handleSave(editing)}
@@ -325,6 +351,7 @@ export function Models() {
 function AliasForm({
   alias,
   providers,
+  providerById,
   existingAliases,
   onChange,
   onSave,
@@ -332,6 +359,7 @@ function AliasForm({
 }: {
   alias: ModelAlias
   providers: Provider[]
+  providerById: Map<string, Provider>
   existingAliases: ModelAlias[]
   onChange: (next: ModelAlias) => void
   onSave: () => void
@@ -386,8 +414,17 @@ function AliasForm({
     }
   }
 
-  const selectedProvider = providers.find((p) => p.id === alias.providerId)
-  const modelPresets = getPresetsForProvider(selectedProvider)
+  // Pull the selected provider out of the map we received from the
+  // parent (parent already memoizes the map by `providers`). Skipping
+  // the inline `providers.find(...)` saves an O(n) scan per keystroke
+  // for the (typically long) providers list.
+  const selectedProvider = providerById.get(alias.providerId)
+  // Preset list is a derived view of the selected provider, so it
+  // gets memoized too — only the preset chips / datalist depend on it.
+  const modelPresets = useMemo(
+    () => getPresetsForProvider(selectedProvider),
+    [selectedProvider],
+  )
   const providerModelSuggestions = selectedProvider?.models ?? []
 
   return (

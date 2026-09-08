@@ -1,5 +1,6 @@
 import type {ReactNode} from 'react'
 import {Card, Typography} from 'antd'
+import {cn} from '@/lib/cn'
 
 /**
  * Shared wrapper around antd `Card` for chart surfaces.
@@ -43,7 +44,7 @@ export function ChartCard({
     <Card
       title={<span className="text-base font-semibold">{title}</span>}
       variant="outlined"
-      className={className}
+      className={cn(className, 'card-depth-2')}
       {...(extra ? {extra} : {})}
       styles={{body: {padding: '24px'}}}
     >

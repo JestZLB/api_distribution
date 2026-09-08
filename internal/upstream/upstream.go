@@ -68,6 +68,21 @@ func (c *Client) touch() {
 	c.lastUsed.Store(time.Now().UnixNano())
 }
 
+// MarkIdleForTest pushes the client's lastUsed timestamp far into
+// the past so a subsequent ReapIdle(0) is guaranteed to evict it.
+//
+// This exists solely for the shutdown regression test
+// (app_shutdown_upstream_test.go). The race we are guarding is
+// "shutdown must call ReapIdle(0) so cached clients are released on
+// exit"; a fresh GetOrCreate → shutdown sequence is too tight
+// timing-wise (lastUsed can equal cutoff within the same Windows
+// 15ms timer tick) for the assertion to be deterministic. Setting
+// lastUsed to time.Hour-ago makes the eviction robust regardless of
+// scheduler jitter.
+func (c *Client) MarkIdleForTest() {
+	c.lastUsed.Store(time.Now().Add(-time.Hour).UnixNano())
+}
+
 // acquire records that a request has begun using this client.
 func (c *Client) acquire() {
 	c.inFlight.Add(1)
@@ -191,15 +206,32 @@ func roundDuration(d time.Duration) time.Duration {
 	return d.Round(time.Second)
 }
 
+// LenForTest returns the number of cached clients currently held in
+// the global registry. It exists for the shutdown regression test
+// (app_shutdown_upstream_test.go) which asserts that App.shutdown
+// empties the cache by calling ReapIdle(0) — without a getter the
+// test could not see inside the package-private `clients` map.
+func LenForTest() int {
+	clientsMu.RLock()
+	defer clientsMu.RUnlock()
+	return len(clients)
+}
+
 func newClient(p types.Provider) *Client {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   5,
+		MaxConnsPerHost:       50,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		// Long-context prompts can make an upstream queue/think for a
+		// while before its first response byte. 30s was too tight and
+		// produced spurious 502s exactly on the longest requests, so
+		// 120s is the ceiling. The caller's ctx still governs the total
+		// request duration.
+		ResponseHeaderTimeout: 120 * time.Second,
 		// TLS verification is enabled by default. Set
 		// InsecureSkipVerify only when the provider explicitly
 		// requires it (e.g. self-signed certs in dev).
