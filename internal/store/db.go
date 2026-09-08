@@ -13,11 +13,27 @@ import (
 	"api_distribution/internal/types"
 )
 
-// DBPath returns the default SQLite database path inside cfgDir. All
+// DefaultDataDir returns the directory that stores the SQLite
+// database: a "data" folder next to the executable. Persisting next to
+// a portable exe keeps stats/logs with the binary instead of the user
+// config directory; the folder is created on first use.
+func DefaultDataDir() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
+	}
+	dir := filepath.Join(filepath.Dir(exe), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create data dir: %w", err)
+	}
+	return dir, nil
+}
+
+// DBPath returns the SQLite database path inside dataDir. All
 // persisted state (per-date aggregates + the log ring buffer) lives in
 // this single file, replacing the previous stats/*.json + logs.json.
-func DBPath(cfgDir string) string {
-	return filepath.Join(cfgDir, "api_distribution.db")
+func DBPath(dataDir string) string {
+	return filepath.Join(dataDir, "api_distribution.db")
 }
 
 // openDB opens (creating if needed) the SQLite database at path and
@@ -25,6 +41,11 @@ func DBPath(cfgDir string) string {
 // connection: SQLite is a single-writer engine and this also keeps an
 // in-memory database (:memory:) alive across calls.
 func openDB(path string) (*Store, error) {
+	// SQLite creates the file lazily but not its parent directory;
+	// ensure the data folder exists so a fresh install works.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

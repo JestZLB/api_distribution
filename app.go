@@ -93,24 +93,43 @@ const (
 	upstreamReapIdle = 5 * time.Minute
 )
 
-// NewApp creates a new App with persistent config in dir.
-func NewApp(dir string) *App {
-	if dir == "" {
-		dir = "."
+// NewApp creates a new App with persistent config in cfgDir and the
+// SQLite database in dataDir. An empty dataDir falls back to the
+// executable-adjacent "./data" directory (store.DefaultDataDir).
+func NewApp(cfgDir, dataDir string) *App {
+	if cfgDir == "" {
+		cfgDir = "."
 	}
-	cfgMgr := config.New(dir)
+	if dataDir == "" {
+		var err error
+		dataDir, err = store.DefaultDataDir()
+		if err != nil {
+			fmt.Println("warning: locate data dir:", err)
+		}
+	}
+	cfgMgr := config.New(cfgDir)
 	if _, err := cfgMgr.Load(); err != nil {
 		fmt.Println("warning: load config:", err)
 	}
-	st, err := store.Open(store.DBPath(dir))
-	if err != nil {
-		fmt.Println("warning: open sqlite, falling back to in-memory:", err)
+	var st *store.Store
+	if dataDir == "" {
+		// DefaultDataDir failed (e.g. the exe lives somewhere read-only);
+		// degrade to an in-memory store rather than writing a stray DB
+		// file next to the working directory.
+		fmt.Println("warning: sqlite data dir unavailable, using in-memory store")
 		st = store.New()
+	} else {
+		var err error
+		st, err = store.Open(store.DBPath(dataDir))
+		if err != nil {
+			fmt.Println("warning: open sqlite, falling back to in-memory:", err)
+			st = store.New()
+		}
 	}
 	srv := server.New(cfgMgr, st)
 
 	return &App{
-		cfgDir:    dir,
+		cfgDir:    cfgDir,
 		cfgMgr:    cfgMgr,
 		store:     st,
 		proxy:     srv,

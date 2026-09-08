@@ -31,7 +31,7 @@ func main() {
 		println("Warning: could not determine config directory:", err.Error())
 	}
 
-	app := NewApp(configDir)
+	app := NewApp(configDir, "")
 
 	// `HideWindowOnClose` is a boot-time option, so we look at the
 	// saved config *before* handing the App to wails.Run. The
