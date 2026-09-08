@@ -16,17 +16,14 @@ import (
 // DefaultDataDir returns the directory that stores the SQLite
 // database: a "data" folder next to the executable. Persisting next to
 // a portable exe keeps stats/logs with the binary instead of the user
-// config directory; the folder is created on first use.
+// config directory. The folder itself is created lazily when the
+// database is opened (see openDB), keeping this a pure path resolver.
 func DefaultDataDir() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locate executable: %w", err)
 	}
-	dir := filepath.Join(filepath.Dir(exe), "data")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create data dir: %w", err)
-	}
-	return dir, nil
+	return filepath.Join(filepath.Dir(exe), "data"), nil
 }
 
 // DBPath returns the SQLite database path inside dataDir. All
