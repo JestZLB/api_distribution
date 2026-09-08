@@ -3,7 +3,7 @@
 一个面向 LLM 应用的本地 API 网关桌面应用，基于 [Wails v2](https://wails.io) 构建。
 对外暴露 **OpenAI 兼容协议**（`/v1/chat/completions` 等），统一代理多个上游（OpenAI、Anthropic、Azure、Gemini、Ollama、任意 OpenAI 兼容端点），支持模型别名、客户端鉴权、流式 token 计量，以及实时流量与统计面板。
 
-![Dashboard Preview](https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=screenshot%20of%20a%20native%20desktop%20application%20window%2C%20modern%20API%20gateway%20analytics%20dashboard%2C%20Linear%20Vercel%20style%20developer%20tool%20UI%2C%20dark%20slate%20background%2C%20deep%20indigo%20primary%20accent%2C%20four%20KPI%20cards%20on%20top%20showing%20token%20consumption%20numbers%20with%20percentage%20change%20indicators%2C%20server%20status%20panel%20with%20pulsing%20online%20indicator%20and%20base%20URL%2C%20stacked%20area%20chart%20of%20hourly%20request%20traffic%2C%20list%20of%20client%20keys%20with%20traffic%20volume%2C%20sidebar%20navigation%2C%20professional%20SaaS%20aesthetic%2C%20clean%20typography&image_size=landscape_16_9)
+![API Distribution](build/appicon.png)
 
 ## ✨ 核心功能
 
