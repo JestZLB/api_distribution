@@ -3,7 +3,7 @@
 一个面向 LLM 应用的本地 API 网关桌面应用，基于 [Wails v2](https://wails.io) 构建。
 对外暴露 **OpenAI 兼容协议**（`/v1/chat/completions` 等），统一代理多个上游（OpenAI、Anthropic、Azure、Gemini、Ollama、任意 OpenAI 兼容端点），支持模型别名、客户端鉴权、流式 token 计量，以及实时流量与统计面板。
 
-![API Distribution](build/appicon.png)
+![API Distribution](./build/appicon.png)
 
 ## ✨ 核心功能
 
