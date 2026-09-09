@@ -289,3 +289,21 @@ h1, h2, h3, h4 {
  * looks unfinished on hero / chart surfaces that skip the header.
  * Cards WITH a header keep their standard square body top. */
 .ant-card:not(:has(.ant-card-head)) .ant-card-body { border-radius: inherit; }
+
+/* Table header — boost contrast over the slate canvas. The antd default
+ * header bg (`colorFillAlterSolid`, derived from `colorFillAlter` on
+ * `colorBgContainer`) sits one step above the slate-50 layout and reads
+ * as a near-invisible divider on the Logs page, where the table is not
+ * wrapped in a Card and the header sits directly on the page canvas.
+ * Tint the header with `colorFillSecondary` (a step darker than the
+ * default) and lock the text to `colorTextHeading` so it stays legible
+ * in both themes. */
+.ant-table-thead > tr > th {
+  background: var(--ant-color-fill-secondary) !important;
+  color: var(--ant-color-text-heading) !important;
+  font-weight: 600 !important;
+  border-bottom: 1px solid var(--ant-color-border-secondary) !important;
+}
+.dark .ant-table-thead > tr > th {
+  background: var(--ant-color-fill-tertiary) !important;
+}

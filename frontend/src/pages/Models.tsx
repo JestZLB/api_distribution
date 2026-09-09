@@ -153,7 +153,7 @@ export function Models() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-8">
       <PageHeader
         title={t('pages.title.models')}
         description={t('pages.desc.models')}

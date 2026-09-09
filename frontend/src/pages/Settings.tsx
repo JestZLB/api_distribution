@@ -234,7 +234,7 @@ export function Settings() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-8">
       <PageHeader
         title={t('pages.title.settings')}
         description={t('pages.desc.settings')}

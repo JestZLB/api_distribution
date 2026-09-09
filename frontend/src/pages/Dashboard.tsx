@@ -202,7 +202,7 @@ export function Dashboard() {
   const isInitial = bootStatus === 'initializing' && !stats
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-6">
       <PageHeader
         title={t('pages.title.dashboard')}
         description={t('pages.desc.dashboard')}

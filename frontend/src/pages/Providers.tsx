@@ -213,7 +213,7 @@ export function Providers() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-6">
       <PageHeader
         title={t('pages.title.providers')}
         description={t('pages.desc.providers')}

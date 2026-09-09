@@ -318,7 +318,7 @@ export function Logs() {
   }), [expandedRowKeys, t])
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-8">
       <PageHeader
         title={t('pages.title.logs')}
         description={t('pages.desc.logs')}
